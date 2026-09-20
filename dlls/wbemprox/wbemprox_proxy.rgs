@@ -1,0 +1,43 @@
+HKCR
+{
+    NoRemove Interface
+    {
+        '{7C857801-7381-11CF-884D-00AA004B2E24}' = s 'IWbemObjectSink'
+        {
+            NumMethods = s 5
+            ProxyStubClsid32 = s '{7C857801-7381-11CF-884D-00AA004B2E24}'
+        }
+        '{9556DC99-828C-11CF-A37E-00AA003240C7}' = s 'IWbemServices'
+        {
+            NumMethods = s 26
+            ProxyStubClsid32 = s '{7C857801-7381-11CF-884D-00AA004B2E24}'
+        }
+        '{44ACA675-E8FC-11D0-A07C-00C04FB68820}' = s 'IWbemCallResult'
+        {
+            NumMethods = s 7
+            ProxyStubClsid32 = s '{7C857801-7381-11CF-884D-00AA004B2E24}'
+        }
+        '{027947E1-D731-11CE-A357-000000000001}' = s 'IEnumWbemClassObject'
+        {
+            NumMethods = s 8
+            ProxyStubClsid32 = s '{7C857801-7381-11CF-884D-00AA004B2E24}'
+        }
+        '{1CFABA8C-1523-11D1-AD79-00C04FD8FDFF}' = s 'IUnsecuredApartment'
+        {
+            NumMethods = s 4
+            ProxyStubClsid32 = s '{7C857801-7381-11CF-884D-00AA004B2E24}'
+        }
+        '{31739D04-3471-4CF4-9A7C-57A44AE71956}' = s 'IWbemUnsecuredApartment'
+        {
+            NumMethods = s 5
+            ProxyStubClsid32 = s '{7C857801-7381-11CF-884D-00AA004B2E24}'
+        }
+    }
+    NoRemove CLSID
+    {
+        '{7C857801-7381-11CF-884D-00AA004B2E24}' = s 'PSFactoryBuffer'
+        {
+            InprocServer32 = s '%MODULE%' { val ThreadingModel = s 'Both' }
+        }
+    }
+}

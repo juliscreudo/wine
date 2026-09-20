@@ -1,0 +1,34 @@
+/*
+ * Proxy/stub for the marshalable WMI interfaces
+ *
+ * Copyright 2026 Samuel Rounce
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
+ */
+
+/* IWbemObjectSink is handed to WMI as an asynchronous callback. A client that
+ * creates its sink on one apartment and passes it to IWbemServices from
+ * another - .NET's System.Management does exactly this - needs the interface
+ * to be marshalable, otherwise the cross-apartment QueryInterface fails with
+ * "No PSFactoryBuffer object is registered".
+ *
+ * This file only generates the proxies. The matching registry entries live in
+ * wbemprox_proxy.rgs, because widl would otherwise also register wbemcli.idl's
+ * top-level coclasses, which are pulled in by the #include below and are not
+ * ours to register. */
+
+#pragma makedep proxy
+
+#include "wbemcli.idl"

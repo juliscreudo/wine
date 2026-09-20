@@ -1,5 +1,5 @@
 MODULE    = wbemprox.dll
-IMPORTS   = winspool version iphlpapi setupapi oleaut32 ole32 advapi32 user32 gdi32 ws2_32
+IMPORTS   = winspool version iphlpapi setupapi oleaut32 ole32 advapi32 user32 gdi32 ws2_32 rpcrt4 uuid
 
 SOURCES = \
 	builtin.c \
@@ -14,6 +14,11 @@ SOURCES = \
 	services.c \
 	sysrestore.c \
 	table.c \
+	unsecapp.c \
 	wbemlocator.c \
 	wbemprox.idl \
+	wbemprox.rc \
+	wbemprox_proxy.idl \
 	wql.y
+
+dlldata_EXTRADEFS = -DENTRY_PREFIX=proxy_ -DPROXY_CLSID=CLSID_WbemProxyPSFactory

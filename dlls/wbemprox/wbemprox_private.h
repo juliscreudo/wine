@@ -250,6 +250,7 @@ HRESULT create_signature( enum wbm_namespace ns, const WCHAR *, const WCHAR *, e
 HRESULT WbemLocator_create(LPVOID *, REFIID);
 HRESULT WbemServices_create(const WCHAR *, IWbemContext *, LPVOID *);
 HRESULT WbemContext_create(void **, REFIID);
+HRESULT UnsecuredApartment_create(void **, REFIID);
 HRESULT create_class_object(enum wbm_namespace ns, const WCHAR *, IEnumWbemClassObject *, UINT,
                             struct record *, IWbemClassObject **);
 HRESULT EnumWbemClassObject_create(struct query *, LPVOID *);

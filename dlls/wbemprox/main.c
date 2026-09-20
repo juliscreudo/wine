@@ -101,8 +101,22 @@ static const struct IClassFactoryVtbl wbemprox_cf_vtbl =
     wbemprox_cf_LockServer
 };
 
+/* CLSID under which the generated proxy/stub factory is registered. This must
+ * stay in sync with the PSFactoryBuffer coclass in wbemprox_proxy.idl, which is
+ * what puts the matching ProxyStubClsid32 entries in the registry.
+ *
+ * The value is IID_IWbemObjectSink, following the usual convention of naming a
+ * proxy factory after one of the interfaces it serves. It is pinned explicitly
+ * rather than left to widl's default (the IID of the first entry of the
+ * generated stub vtbl list) because widl sorts that list by IID, so adding an
+ * interface to wbemcli.idl could otherwise change the CLSID silently. */
+CLSID CLSID_WbemProxyPSFactory = {0x7c857801,0x7381,0x11cf,{0x88,0x4d,0x00,0xaa,0x00,0x4b,0x2e,0x24}};
+
+extern HRESULT WINAPI proxy_DllGetClassObject( REFCLSID rclsid, REFIID iid, void **ppv );
+
 static wbemprox_cf wbem_locator_cf = { { &wbemprox_cf_vtbl }, WbemLocator_create };
 static wbemprox_cf wbem_context_cf = { { &wbemprox_cf_vtbl }, WbemContext_create };
+static wbemprox_cf unsecured_apartment_cf = { { &wbemprox_cf_vtbl }, UnsecuredApartment_create };
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 {
@@ -137,6 +151,12 @@ HRESULT WINAPI DllGetClassObject( REFCLSID rclsid, REFIID iid, LPVOID *ppv )
     {
        cf = &wbem_context_cf.IClassFactory_iface;
     }
-    if (!cf) return CLASS_E_CLASSNOTAVAILABLE;
+    else if (IsEqualGUID( rclsid, &CLSID_UnsecuredApartment ))
+    {
+       cf = &unsecured_apartment_cf.IClassFactory_iface;
+    }
+    /* not one of ours - it may be the proxy/stub factory for the marshalable
+     * WMI interfaces */
+    if (!cf) return proxy_DllGetClassObject( rclsid, iid, ppv );
     return IClassFactory_QueryInterface( cf, iid, ppv );
 }

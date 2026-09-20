@@ -307,6 +307,24 @@ static ULONG stub_manager_int_addref(struct stub_manager *m)
     return refs;
 }
 
+/* The apartment's IRemUnknown is published through a normal stub manager, so it
+ * is torn down as soon as its last external reference is released. The
+ * apartment must keep answering IRemUnknown calls for as long as it has objects
+ * marshalled, so note when it goes away and let it be re-exported on demand.
+ *
+ * The caller must hold apt->cs and must only call this once the stub manager has
+ * dropped to zero internal references. The ifstub list is otherwise guarded by
+ * m->lock, but at that point no other thread can still reach the manager. */
+static BOOL stub_manager_is_remunknown(struct stub_manager *m)
+{
+    struct ifstub *ifstub;
+
+    LIST_FOR_EACH_ENTRY(ifstub, &m->ifstubs, struct ifstub, entry)
+        if (ifstub->flags & MSHLFLAGSP_REMUNKNOWN) return TRUE;
+
+    return FALSE;
+}
+
 /* decrements the internal refcount */
 ULONG stub_manager_int_release(struct stub_manager *m)
 {
@@ -320,7 +338,10 @@ ULONG stub_manager_int_release(struct stub_manager *m)
 
     /* remove from apartment so no other thread can access it... */
     if (!refs)
+    {
+        if (stub_manager_is_remunknown(m)) apt->remunk_exported = FALSE;
         list_remove(&m->entry);
+    }
 
     LeaveCriticalSection(&apt->cs);
 
@@ -490,7 +511,7 @@ static struct stub_manager *get_stub_manager_from_ipid(struct apartment *apt, co
     if (result)
         TRACE("found %p for ipid %s\n", result, debugstr_guid(ipid));
     else
-        ERR("not found for ipid %s\n", debugstr_guid(ipid));
+        TRACE("not found for ipid %s\n", debugstr_guid(ipid));
 
     return result;
 }
@@ -511,8 +532,24 @@ static HRESULT ipid_to_ifstub(const IPID *ipid, struct apartment **stub_apt,
         return RPC_E_INVALID_OBJECT;
     }
     *stubmgr_ret = get_stub_manager_from_ipid(*stub_apt, ipid, ifstub);
+    if (!*stubmgr_ret && ipid->Data2 == 0xffff)
+    {
+        /* The IRemUnknown stub for this apartment has been released since it
+         * was first exported. Bring it back so that incoming RemQueryInterface
+         * calls keep working.
+         *
+         * Note that we run on an RPC dispatch thread here, not on the thread
+         * that owns *stub_apt. That is safe because the re-exported ifstub
+         * reuses the OXID-derived ipidRemUnknown rather than generating a new
+         * IPID, and because any apartment that ever had an IRemUnknown has
+         * already marshalled an object from its own thread, so marshal_object()
+         * will not end up creating the apartment window from under us. */
+        if (SUCCEEDED(start_apartment_remote_unknown(*stub_apt)))
+            *stubmgr_ret = get_stub_manager_from_ipid(*stub_apt, ipid, ifstub);
+    }
     if (!*stubmgr_ret)
     {
+        ERR("not found for ipid %s\n", debugstr_guid(ipid));
         apartment_release(*stub_apt);
         *stub_apt = NULL;
         return RPC_E_INVALID_OBJECT;
