@@ -1295,6 +1295,62 @@ static void bus_options_reload(void)
     winebus_call(iohid_rescan, NULL);
 }
 
+static HANDLE options_thread, options_stop_event;
+
+static BOOL arm_options_notification(HANDLE event)
+{
+    IO_STATUS_BLOCK io;
+    NTSTATUS status;
+
+    status = NtNotifyChangeKey(driver_key, event, NULL, NULL, &io, REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET,
+                               TRUE, NULL, 0, TRUE);
+    if (status && status != STATUS_PENDING) ERR("NtNotifyChangeKey failed, status %#lx\n", status);
+    return !status || status == STATUS_PENDING;
+}
+
+/* Watches the service key so registry edits take effect without a restart.
+ * A registration fires once, so the sequence is: wake, let a burst of writes
+ * settle, re-arm, then reload. Anything written before the re-arm is seen by
+ * the reload, anything after it wakes the thread again. */
+static DWORD WINAPI options_watch_thread(void *arg)
+{
+    HANDLE handles[2] = {options_stop_event};
+
+    if (!(handles[1] = CreateEventW(NULL, FALSE, FALSE, NULL))) return 0;
+
+    if (arm_options_notification(handles[1])) for (;;)
+    {
+        if (WaitForMultipleObjects(2, handles, FALSE, INFINITE) != WAIT_OBJECT_0 + 1) break;
+        Sleep(200);
+        if (!arm_options_notification(handles[1])) break;
+        TRACE("reloading options\n");
+        bus_options_reload();
+    }
+
+    CloseHandle(handles[1]);
+    return 0;
+}
+
+static void options_watch_start(void)
+{
+    if (!(options_stop_event = CreateEventW(NULL, TRUE, FALSE, NULL))) return;
+    options_thread = CreateThread(NULL, 0, options_watch_thread, NULL, 0, NULL);
+}
+
+static void options_watch_stop(void)
+{
+    if (!options_stop_event) return;
+    SetEvent(options_stop_event);
+    if (options_thread)
+    {
+        WaitForSingleObject(options_thread, INFINITE);
+        CloseHandle(options_thread);
+        options_thread = NULL;
+    }
+    CloseHandle(options_stop_event);
+    options_stop_event = NULL;
+}
+
 static NTSTATUS sdl_driver_init(void)
 {
     struct bus_main_params bus =
@@ -1352,6 +1408,7 @@ static NTSTATUS fdo_pnp_dispatch(DEVICE_OBJECT *device, IRP *irp)
         if (!sdl_driver_init()) options.disable_input = TRUE;
         udev_driver_init();
         iohid_driver_init();
+        options_watch_start();
 
         irp->IoStatus.Status = STATUS_SUCCESS;
         break;
@@ -1359,6 +1416,7 @@ static NTSTATUS fdo_pnp_dispatch(DEVICE_OBJECT *device, IRP *irp)
         irp->IoStatus.Status = STATUS_SUCCESS;
         break;
     case IRP_MN_REMOVE_DEVICE:
+        options_watch_stop();
         winebus_call(sdl_stop, NULL);
         winebus_call(udev_stop, NULL);
         winebus_call(iohid_stop, NULL);
