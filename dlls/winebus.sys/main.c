@@ -269,6 +269,7 @@ static WCHAR *get_compatible_ids(DEVICE_OBJECT *device)
 {
     static const WCHAR xinput_compat[] = L"WINEBUS\\WINE_COMP_XINPUT";
     static const WCHAR hidraw_compat[] = L"WINEBUS\\WINE_COMP_HIDRAW";
+    static const WCHAR hidraw_available_compat[] = L"WINEBUS\\WINE_COMP_HIDRAW_AVAILABLE";
     static const WCHAR hid_compat[] = L"WINEBUS\\WINE_COMP_HID";
     struct device_extension *ext = (struct device_extension *)device->DeviceExtension;
     WCHAR usb_compat[71];
@@ -296,6 +297,7 @@ static WCHAR *get_compatible_ids(DEVICE_OBJECT *device)
     size = sizeof(hid_compat) + usb_len * sizeof(WCHAR);
     if (ext->desc.is_gamepad) size += sizeof(xinput_compat);
     if (ext->desc.is_hidraw) size += sizeof(hidraw_compat);
+    if (!ext->desc.is_hidraw && ext->desc.hidraw_available) size += sizeof(hidraw_available_compat);
 
     if ((dst = ExAllocatePool(PagedPool, size + sizeof(WCHAR))))
     {
@@ -310,6 +312,12 @@ static WCHAR *get_compatible_ids(DEVICE_OBJECT *device)
         {
             memcpy(pos, hidraw_compat, sizeof(hidraw_compat));
             pos += sizeof(hidraw_compat) / sizeof(WCHAR);
+        }
+        /* and whether an evdev/SDL device could be switched to a readable hidraw node */
+        if (!ext->desc.is_hidraw && ext->desc.hidraw_available)
+        {
+            memcpy(pos, hidraw_available_compat, sizeof(hidraw_available_compat));
+            pos += sizeof(hidraw_available_compat) / sizeof(WCHAR);
         }
         memcpy(pos, hid_compat, sizeof(hid_compat));
         pos += sizeof(hid_compat) / sizeof(WCHAR);
