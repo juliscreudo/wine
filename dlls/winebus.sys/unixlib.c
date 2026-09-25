@@ -335,7 +335,7 @@ C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count);
 void bus_event_cleanup(struct bus_event *event)
 {
     struct unix_device *iface = (struct unix_device *)(UINT_PTR)event->device;
-    if (event->type == BUS_EVENT_TYPE_NONE) return;
+    if (event->type == BUS_EVENT_TYPE_NONE || !event->device) return;
     unix_device_decref(iface);
 }
 
@@ -433,6 +433,23 @@ BOOL bus_event_queue_pop(struct list *queue, struct bus_event *event)
 
     memcpy(event, &entry->event, size);
     free(entry);
+
+    return TRUE;
+}
+
+BOOL bus_event_queue_node(struct list *queue, UINT type, const char *devnode, const struct device_desc *desc,
+                          const USAGE_AND_PAGE *usages, const char *error)
+{
+    struct bus_event_entry *entry = calloc(1, sizeof(*entry));
+    if (!entry) return FALSE;
+
+    entry->event.type = type;
+    entry->event.device = 0;
+    ntdll_umbstowcs(devnode, strlen(devnode) + 1, entry->event.node.devnode, ARRAY_SIZE(entry->event.node.devnode));
+    if (desc) entry->event.node.desc = *desc;
+    if (usages) entry->event.node.usages = *usages;
+    if (error) ntdll_umbstowcs(error, strlen(error) + 1, entry->event.node.error, ARRAY_SIZE(entry->event.node.error));
+    list_add_tail(queue, &entry->entry);
 
     return TRUE;
 }

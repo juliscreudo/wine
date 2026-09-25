@@ -1367,6 +1367,94 @@ static NTSTATUS lnxev_device_create(struct udev_device *dev, int fd, const char 
 #endif
 }
 
+/* Nodes the bus could not open, usually a hidraw node without a udev rule.
+ * Reported to the PE side so joy.cpl can say why a device is missing or
+ * served through evdev/SDL instead. */
+struct inaccessible_node
+{
+    struct list entry;
+    char devnode[MAX_PATH];
+};
+
+static struct list inaccessible_nodes = LIST_INIT(inaccessible_nodes);
+
+static struct inaccessible_node *find_inaccessible_node(const char *devnode)
+{
+    struct inaccessible_node *node;
+
+    LIST_FOR_EACH_ENTRY(node, &inaccessible_nodes, struct inaccessible_node, entry)
+        if (!strcmp(node->devnode, devnode)) return node;
+    return NULL;
+}
+
+/* First top-level collection usage from the sysfs report descriptor, which
+ * is world readable even when the node is not. */
+static BOOL read_sysfs_usages(struct udev_device *dev, USAGE_AND_PAGE *usages)
+{
+    struct udev_device *hid = udev_device_get_parent_with_subsystem_devtype(dev, "hid", NULL);
+    unsigned char buffer[4096], *ptr, *end;
+    UINT usage_page = 0, usage = 0, size, value;
+    char path[PATH_MAX];
+    int fd, len;
+
+    if (!hid) return FALSE;
+    snprintf(path, sizeof(path), "%s/report_descriptor", udev_device_get_syspath(hid));
+    if ((fd = open(path, O_RDONLY)) == -1) return FALSE;
+    len = read(fd, buffer, sizeof(buffer));
+    close(fd);
+    if (len <= 0) return FALSE;
+
+    for (ptr = buffer, end = buffer + len; ptr < end; ptr += 1 + size)
+    {
+        if (*ptr == 0xfe) /* long item */
+        {
+            if (ptr + 2 > end) break;
+            size = ptr[1] + 2;
+            continue;
+        }
+        size = *ptr & 3;
+        if (size == 3) size = 4;
+        if (ptr + 1 + size > end) break;
+        for (value = 0, len = size; len > 0; len--) value = (value << 8) | ptr[len];
+
+        switch (*ptr & 0xfc)
+        {
+        case 0x04: usage_page = value; break;      /* global: usage page */
+        case 0x08: usage = value; break;           /* local: usage */
+        case 0xa0:                                 /* main: collection */
+            usages->UsagePage = usage_page;
+            usages->Usage = usage;
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+static void report_inaccessible_node(struct udev_device *dev, const char *devnode, struct device_desc *desc, int error)
+{
+    struct inaccessible_node *node;
+    USAGE_AND_PAGE usages = {0};
+
+    if (find_inaccessible_node(devnode)) return;
+    if (!(node = calloc(1, sizeof(*node)))) return;
+    strcpy(node->devnode, devnode);
+    list_add_tail(&inaccessible_nodes, &node->entry);
+
+    read_sysfs_usages(dev, &usages);
+    bus_event_queue_node(&event_queue, BUS_EVENT_TYPE_NODE_INACCESSIBLE, devnode, desc, &usages, strerror(error));
+}
+
+static void forget_inaccessible_node(const char *devnode)
+{
+    struct inaccessible_node *node = find_inaccessible_node(devnode);
+
+    if (!node) return;
+    list_remove(&node->entry);
+    free(node);
+    bus_event_queue_node(&event_queue, BUS_EVENT_TYPE_NODE_REMOVED, devnode, NULL, NULL, NULL);
+}
+
 static void udev_add_device(struct udev_device *dev, int fd)
 {
     struct device_desc desc = { .input = -1, .bus_id = -1 };
@@ -1387,14 +1475,6 @@ static void udev_add_device(struct udev_device *dev, int fd)
         return;
     }
 
-    if (fd < 0 && (fd = open(devnode, O_RDWR)) == -1)
-    {
-        WARN("Unable to open udev device %s: %s\n", debugstr_a(devnode), strerror(errno));
-        return;
-    }
-
-    TRACE("udev %s syspath %s\n", debugstr_a(devnode), udev_device_get_syspath(dev));
-
     get_device_subsystem_info(dev, "hid", NULL, &desc, &bus);
     get_device_subsystem_info(dev, "input", NULL, &desc, &bus);
     get_device_subsystem_info(dev, "usb", "usb_device", &desc, &bus);
@@ -1402,6 +1482,16 @@ static void udev_add_device(struct udev_device *dev, int fd)
     else if (bus == BUS_USB) desc.bus_type = BUS_TYPE_USB;
 
     if (desc.bus_type == BUS_TYPE_USB) get_usb_interface_info(dev, &desc);
+
+    if (fd < 0 && (fd = open(devnode, O_RDWR)) == -1)
+    {
+        WARN("Unable to open udev device %s: %s\n", debugstr_a(devnode), strerror(errno));
+        report_inaccessible_node(dev, devnode, &desc, errno);
+        return;
+    }
+    forget_inaccessible_node(devnode);
+
+    TRACE("udev %s syspath %s\n", debugstr_a(devnode), udev_device_get_syspath(dev));
 
     if (!(subsystem = udev_device_get_subsystem(dev)))
     {
@@ -1769,6 +1859,7 @@ static void process_monitor_event(struct udev_monitor *monitor)
     {
         impl = find_device_from_devnode(devnode);
         if (impl) bus_event_queue_device_removed(&event_queue, &impl->unix_device);
+        else if (find_inaccessible_node(devnode)) forget_inaccessible_node(devnode);
         else WARN("failed to find device for udev device %p\n", dev);
     }
 

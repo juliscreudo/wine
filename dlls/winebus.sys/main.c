@@ -931,6 +931,103 @@ static USAGE_AND_PAGE get_device_usages(UINT64 unix_device)
 static DWORD bus_count;
 static HANDLE bus_thread[16];
 
+/* Device nodes the backends could not open, published for joy.cpl under the
+ * volatile HKEY_DYN_DATA\WineBus\Nodes\<node> so they vanish with the session.
+ * Kept outside the service key, which the options watcher reacts to. */
+static HANDLE open_nodes_key(const WCHAR *node, BOOL create)
+{
+    /* NtCreateKey does not create intermediate keys, walk the path */
+    static const WCHAR *const components[] = {L"\\Registry\\DynData", L"WineBus", L"Nodes"};
+    OBJECT_ATTRIBUTES attr = {.Length = sizeof(attr), .Attributes = OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE};
+    HANDLE key = NULL, parent = NULL;
+    UNICODE_STRING str;
+    NTSTATUS status;
+    UINT i;
+
+    for (i = 0; i <= ARRAY_SIZE(components); i++)
+    {
+        const WCHAR *name = i < ARRAY_SIZE(components) ? components[i] : node;
+
+        if (!name) break;
+        RtlInitUnicodeString(&str, name);
+        attr.ObjectName = &str;
+        attr.RootDirectory = parent;
+        if (create) status = NtCreateKey(&key, KEY_ALL_ACCESS, &attr, 0, NULL, REG_OPTION_VOLATILE, NULL);
+        else status = NtOpenKey(&key, KEY_ALL_ACCESS, &attr);
+        if (parent) NtClose(parent);
+        if (status)
+        {
+            if (create) ERR("failed to create %s, status %#lx\n", debugstr_w(name), status);
+            return NULL;
+        }
+        parent = key;
+    }
+
+    return key;
+}
+
+static void set_node_value(HANDLE key, const WCHAR *name, ULONG type, const void *data, ULONG size)
+{
+    UNICODE_STRING str;
+    RtlInitUnicodeString(&str, name);
+    NtSetValueKey(key, &str, 0, type, data, size);
+}
+
+static const WCHAR *node_key_name(const WCHAR *devnode)
+{
+    const WCHAR *name = wcsrchr(devnode, '/');
+    return name ? name + 1 : devnode;
+}
+
+static void publish_inaccessible_node(const struct bus_event *event)
+{
+    const struct device_desc *desc = &event->node.desc;
+    DWORD vid = desc->vid, pid = desc->pid, page = event->node.usages.UsagePage, usage = event->node.usages.Usage;
+    HANDLE key;
+
+    TRACE("node %s vid %04lx pid %04lx usages %04lx:%04lx: %s\n", debugstr_w(event->node.devnode), vid, pid,
+          page, usage, debugstr_w(event->node.error));
+
+    if (!(key = open_nodes_key(node_key_name(event->node.devnode), TRUE))) return;
+    set_node_value(key, L"Node", REG_SZ, event->node.devnode, (wcslen(event->node.devnode) + 1) * sizeof(WCHAR));
+    set_node_value(key, L"Error", REG_SZ, event->node.error, (wcslen(event->node.error) + 1) * sizeof(WCHAR));
+    set_node_value(key, L"Product", REG_SZ, desc->product, (wcslen(desc->product) + 1) * sizeof(WCHAR));
+    set_node_value(key, L"VID", REG_DWORD, &vid, sizeof(vid));
+    set_node_value(key, L"PID", REG_DWORD, &pid, sizeof(pid));
+    set_node_value(key, L"UsagePage", REG_DWORD, &page, sizeof(page));
+    set_node_value(key, L"Usage", REG_DWORD, &usage, sizeof(usage));
+    NtClose(key);
+}
+
+static void unpublish_node(const WCHAR *node)
+{
+    HANDLE key;
+
+    if (!(key = open_nodes_key(node, FALSE))) return;
+    NtDeleteKey(key);
+    NtClose(key);
+}
+
+/* A previous instance of the driver in this session may have left entries. */
+static void clear_published_nodes(void)
+{
+    char buffer[offsetof(KEY_BASIC_INFORMATION, Name[64])];
+    KEY_BASIC_INFORMATION *info = (KEY_BASIC_INFORMATION *)buffer;
+    WCHAR name[64];
+    HANDLE key;
+    ULONG size;
+
+    if (!(key = open_nodes_key(NULL, TRUE))) return;
+    while (!NtEnumerateKey(key, 0, KeyBasicInformation, info, sizeof(buffer), &size))
+    {
+        memcpy(name, info->Name, info->NameLength);
+        name[info->NameLength / sizeof(WCHAR)] = 0;
+        unpublish_node(name);
+    }
+    NtClose(key);
+}
+
+
 struct bus_main_params
 {
     const WCHAR *name;
@@ -963,6 +1060,12 @@ static DWORD CALLBACK bus_main_thread(void *args)
         switch (event->type)
         {
         case BUS_EVENT_TYPE_NONE: break;
+        case BUS_EVENT_TYPE_NODE_INACCESSIBLE:
+            publish_inaccessible_node(event);
+            break;
+        case BUS_EVENT_TYPE_NODE_REMOVED:
+            unpublish_node(node_key_name(event->node.devnode));
+            break;
         case BUS_EVENT_TYPE_DEVICE_REMOVED:
             RtlEnterCriticalSection(&device_list_cs);
             device = bus_find_unix_device(event->device);
@@ -1401,6 +1504,7 @@ static NTSTATUS fdo_pnp_dispatch(DEVICE_OBJECT *device, IRP *irp)
         break;
     case IRP_MN_START_DEVICE:
         bus_options_init();
+        clear_published_nodes();
 
         mouse_device_create();
         keyboard_device_create();

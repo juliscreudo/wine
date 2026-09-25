@@ -76,6 +76,8 @@ enum bus_event_type
     BUS_EVENT_TYPE_DEVICE_REMOVED,
     BUS_EVENT_TYPE_DEVICE_CREATED,
     BUS_EVENT_TYPE_INPUT_REPORT,
+    BUS_EVENT_TYPE_NODE_INACCESSIBLE, /* a device node the backend could not open, no unix device */
+    BUS_EVENT_TYPE_NODE_REMOVED,      /* that node went away or became readable */
 };
 
 enum bus_type
@@ -102,6 +104,14 @@ struct bus_event
             USHORT length;
             BYTE buffer[1];
         } input_report;
+
+        struct
+        {
+            struct device_desc desc;
+            USAGE_AND_PAGE usages; /* first top-level collection, read from sysfs */
+            WCHAR devnode[64];
+            WCHAR error[64];
+        } node;
     };
 };
 
