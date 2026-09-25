@@ -56,9 +56,14 @@ struct hid_device
     USHORT vid, pid;
     USAGE usage_page, usage;
     BOOL hidraw;
+    BOOL present;        /* served by winebus; FALSE for a node it could not open at all */
+    WCHAR node[64];      /* hidraw node winebus could not open, from HKEY_DYN_DATA\WineBus\Nodes */
+    WCHAR node_error[64];
 };
 
 static struct list hid_devices = LIST_INIT( hid_devices );
+
+static void merge_inaccessible_nodes(void);
 
 static void clear_hid_devices(void)
 {
@@ -188,10 +193,83 @@ static void enum_hid_devices(void)
 
         TRACE( "%s vid %04x pid %04x usage %04x:%04x hidraw %u\n", debugstr_w(detail->DevicePath), device->vid,
                device->pid, device->usage_page, device->usage, device->hidraw );
+        device->present = TRUE;
         list_add_tail( &hid_devices, &device->entry );
     }
 
     SetupDiDestroyDeviceInfoList( set );
+    merge_inaccessible_nodes();
+}
+
+static struct hid_device *find_hid_device_by_id( USHORT vid, USHORT pid )
+{
+    struct hid_device *device;
+
+    LIST_FOR_EACH_ENTRY( device, &hid_devices, struct hid_device, entry )
+        if (device->vid == vid && device->pid == pid && device->present) return device;
+    return NULL;
+}
+
+static DWORD get_node_dword( HKEY key, const WCHAR *name )
+{
+    DWORD value = 0, size = sizeof(value);
+    RegQueryValueExW( key, name, NULL, NULL, (BYTE *)&value, &size );
+    return value;
+}
+
+/* Nodes winebus could not open, published under HKEY_DYN_DATA\WineBus\Nodes.
+ * Annotates the device when winebus serves it another way, otherwise adds a
+ * row so the user sees why the device is missing. Keyboards, mice and
+ * digitizers are left out, winebus would not take those on hidraw anyway. */
+static void merge_inaccessible_nodes(void)
+{
+    WCHAR name[64], product[128];
+    struct hid_device *device;
+    DWORD i, size, len;
+    HKEY key, sub;
+
+    if (RegOpenKeyExW( HKEY_DYN_DATA, L"WineBus\\Nodes", 0, KEY_READ, &key )) return;
+
+    for (i = 0; len = ARRAY_SIZE(name), !RegEnumKeyExW( key, i, name, &len, NULL, NULL, NULL, NULL ); i++)
+    {
+        USHORT vid, pid;
+        USAGE page, usage;
+
+        if (RegOpenKeyExW( key, name, 0, KEY_READ, &sub )) continue;
+        vid = get_node_dword( sub, L"VID" );
+        pid = get_node_dword( sub, L"PID" );
+        page = get_node_dword( sub, L"UsagePage" );
+        usage = get_node_dword( sub, L"Usage" );
+
+        if (!(device = find_hid_device_by_id( vid, pid )))
+        {
+            BOOL unsupported = page == HID_USAGE_PAGE_DIGITIZER ||
+                               (page == HID_USAGE_PAGE_GENERIC &&
+                                (usage == HID_USAGE_GENERIC_MOUSE || usage == HID_USAGE_GENERIC_KEYBOARD));
+            if (unsupported || !(device = calloc( 1, sizeof(*device) )))
+            {
+                RegCloseKey( sub );
+                continue;
+            }
+            device->vid = vid;
+            device->pid = pid;
+            device->usage_page = page;
+            device->usage = usage;
+            size = sizeof(product);
+            if (!RegQueryValueExW( sub, L"Product", NULL, NULL, (BYTE *)product, &size )) wcscpy( device->product, product );
+            list_add_tail( &hid_devices, &device->entry );
+        }
+
+        size = sizeof(device->node);
+        RegQueryValueExW( sub, L"Node", NULL, NULL, (BYTE *)device->node, &size );
+        size = sizeof(device->node_error);
+        RegQueryValueExW( sub, L"Error", NULL, NULL, (BYTE *)device->node_error, &size );
+        TRACE( "node %s vid %04x pid %04x usage %04x:%04x %s: %s\n", debugstr_w(device->node), vid, pid, page, usage,
+               device->present ? "served otherwise" : "missing", debugstr_w(device->node_error) );
+        RegCloseKey( sub );
+    }
+
+    RegCloseKey( key );
 }
 
 /* Per-device override under WineBus\Devices\VVVV/PPPP, -1 when unset. */
@@ -264,6 +342,25 @@ static BOOL is_hidraw_forced( USHORT vid, USHORT pid )
 static void describe_device( const struct hid_device *device, INT override, WCHAR *text, SIZE_T len )
 {
     INT vendor = get_device_override( device->vid, device->pid, TRUE );
+    SIZE_T used;
+
+    if (!device->present)
+    {
+        swprintf( text, len, L"Not accessible: winebus cannot open %s (%s). Grant access with a udev rule, "
+                             L"for example TAG+=\"uaccess\" for this VID/PID, then replug the device.",
+                  device->node, device->node_error );
+        return;
+    }
+
+    if (device->node[0])
+    {
+        used = swprintf( text, len, L"Its hidraw node %s is not readable (%s), so it is served through SDL / evdev. "
+                                    L"Forcing hidraw has no effect until a udev rule grants access. ",
+                         device->node, device->node_error );
+        if (override < 0 && vendor < 0 && !is_hidraw_forced( device->vid, device->pid )) return;
+        text += used;
+        len -= used;
+    }
 
     if (override >= 0)
         swprintf( text, len, L"Per-device override for %04X:%04X. Default lets winebus decide again.",
@@ -295,8 +392,8 @@ static void update_override_controls( HWND hwnd )
 
     for (i = 0; i < ARRAY_SIZE(ids); i++)
     {
-        EnableWindow( GetDlgItem( hwnd, ids[i] ), !!device );
-        CheckDlgButton( hwnd, ids[i], device && ids[i] == checked ? BST_CHECKED : BST_UNCHECKED );
+        EnableWindow( GetDlgItem( hwnd, ids[i] ), device && device->present );
+        CheckDlgButton( hwnd, ids[i], device && device->present && ids[i] == checked ? BST_CHECKED : BST_UNCHECKED );
     }
     SetDlgItemTextW( hwnd, IDC_HID_INFO, text );
 }
@@ -381,7 +478,7 @@ static void refresh_hid_list( HWND hwnd )
         SendMessageW( list, LVM_SETITEMTEXTW, item.iItem, (LPARAM)&item );
 
         item.iSubItem = 3;
-        item.pszText = (WCHAR *)(device->hidraw ? L"hidraw" : L"SDL / evdev");
+        item.pszText = (WCHAR *)(!device->present ? L"none" : device->hidraw ? L"hidraw" : L"SDL / evdev");
         SendMessageW( list, LVM_SETITEMTEXTW, item.iItem, (LPARAM)&item );
 
         override = get_device_override( device->vid, device->pid, FALSE );

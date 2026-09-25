@@ -125,7 +125,7 @@ FONT 8, "Ms Shell Dlg"
     AUTORADIOBUTTON "&Default", IDC_HID_DEFAULT, 20, 194, 120, 10, WS_GROUP | WS_TABSTOP
     AUTORADIOBUTTON "&hidraw (the device's own report descriptor)", IDC_HID_HIDRAW, 20, 206, 250, 10
     AUTORADIOBUTTON "&SDL / evdev", IDC_HID_EVDEV, 20, 218, 120, 10
-    LTEXT           "", IDC_HID_INFO, 10, 238, 300, 50
+    LTEXT           "", IDC_HID_INFO, 10, 238, 300, 56
 }
 
 LANGUAGE LANG_NEUTRAL, SUBLANG_NEUTRAL
