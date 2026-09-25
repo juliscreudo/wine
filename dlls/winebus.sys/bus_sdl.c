@@ -122,6 +122,7 @@ static Uint16 (*pSDL_JoystickGetProductVersion)(SDL_Joystick * joystick);
 static Uint16 (*pSDL_JoystickGetVendor)(SDL_Joystick * joystick);
 static SDL_JoystickType (*pSDL_JoystickGetType)(SDL_Joystick * joystick);
 static const char *(*pSDL_JoystickGetSerial)(SDL_Joystick * joystick);
+static const char *(*pSDL_JoystickPath)(SDL_Joystick * joystick);
 
 /* internal bits for extended rumble support, SDL_Haptic types are 16-bits */
 #define WINE_SDL_JOYSTICK_RUMBLE  0x40000000 /* using SDL_JoystickRumble API */
@@ -940,7 +941,7 @@ static void sdl_add_device(unsigned int index)
     SDL_JoystickID id;
     SDL_JoystickType joystick_type;
     SDL_GameController *controller = NULL;
-    const char *product, *sdl_serial;
+    const char *product, *sdl_serial, *path;
     char buffer[ARRAY_SIZE(desc.product)];
     int axis_count, axis_offset;
 
@@ -976,6 +977,10 @@ static void sdl_add_device(unsigned int index)
 
     if (pSDL_JoystickGetSerial && (sdl_serial = pSDL_JoystickGetSerial(joystick)))
         ntdll_umbstowcs(sdl_serial, strlen(sdl_serial) + 1, desc.serialnumber, ARRAY_SIZE(desc.serialnumber));
+
+    /* Without SDL_JoystickPath (SDL < 2.24) assume a hidraw counterpart exists. */
+    if (!pSDL_JoystickPath || !(path = pSDL_JoystickPath(joystick))) desc.hidraw_available = TRUE;
+    else desc.hidraw_available = evdev_hidraw_available(path);
 
     if (controller)
     {
@@ -1147,6 +1152,7 @@ NTSTATUS sdl_bus_init(void *args)
     pSDL_JoystickGetVendor = dlsym(sdl_handle, "SDL_JoystickGetVendor");
     pSDL_JoystickGetType = dlsym(sdl_handle, "SDL_JoystickGetType");
     pSDL_JoystickGetSerial = dlsym(sdl_handle, "SDL_JoystickGetSerial");
+    pSDL_JoystickPath = dlsym(sdl_handle, "SDL_JoystickPath");
 
     if (pSDL_Init(SDL_INIT_GAMECONTROLLER | SDL_INIT_HAPTIC) < 0)
     {

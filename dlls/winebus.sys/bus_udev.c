@@ -1393,7 +1393,11 @@ static void udev_add_device(struct udev_device *dev, int fd)
     }
 
     if ((desc.is_hidraw = !strcmp(subsystem, "hidraw")) && !hidraw_device_create(dev, fd, devnode, desc)) return;
-    if (!strcmp(subsystem, "input") && !lnxev_device_create(dev, fd, devnode, desc)) return;
+    if (!strcmp(subsystem, "input"))
+    {
+        desc.hidraw_available = evdev_hidraw_available(devnode);
+        if (!lnxev_device_create(dev, fd, devnode, desc)) return;
+    }
     close(fd);
 }
 

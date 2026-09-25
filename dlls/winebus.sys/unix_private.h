@@ -242,6 +242,8 @@ extern BOOL bus_event_queue_input_report(struct list *queue, struct unix_device 
                                          BYTE *report, USHORT length);
 extern BOOL bus_event_queue_pop(struct list *queue, struct bus_event *event);
 
+extern BOOL evdev_hidraw_available(const char *devnode);
+
 extern BOOL hid_device_begin_report_descriptor(struct unix_device *iface, const USAGE_AND_PAGE *device_usage);
 extern BOOL hid_device_end_report_descriptor(struct unix_device *iface);
 

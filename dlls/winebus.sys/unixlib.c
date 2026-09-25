@@ -24,6 +24,11 @@
 
 #include <stdarg.h>
 #include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <limits.h>
+#include <dirent.h>
+#include <unistd.h>
 
 #include "ntstatus.h"
 #include "windef.h"
@@ -427,4 +432,38 @@ BOOL bus_event_queue_pop(struct list *queue, struct bus_event *event)
     free(entry);
 
     return TRUE;
+}
+
+/* Whether the HID device behind an evdev node also exposes a hidraw node we
+ * could open. The bus keeps one of the two, and prefers hidraw, so a joystick
+ * whose hidraw node is missing (virtual uinput devices, non-HID drivers) or
+ * unreadable (no udev rule) must be kept on its evdev/SDL side instead. */
+BOOL evdev_hidraw_available(const char *devnode)
+{
+#ifdef __linux__
+    char path[PATH_MAX];
+    struct dirent *entry;
+    BOOL available = FALSE;
+    const char *base;
+    DIR *dir;
+
+    if (!strncmp(devnode, "/dev/hidraw", 11)) return TRUE;
+    if (strncmp(devnode, "/dev/input/event", 16)) return TRUE;
+
+    base = devnode + strlen("/dev/input/");
+    snprintf(path, sizeof(path), "/sys/class/input/%s/device/device/hidraw", base);
+    if (!(dir = opendir(path))) return FALSE;
+
+    while (!available && (entry = readdir(dir)))
+    {
+        if (strncmp(entry->d_name, "hidraw", 6)) continue;
+        snprintf(path, sizeof(path), "/dev/%s", entry->d_name);
+        available = !access(path, R_OK | W_OK);
+    }
+
+    closedir(dir);
+    return available;
+#else
+    return TRUE;
+#endif
 }

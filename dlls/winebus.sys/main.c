@@ -938,9 +938,13 @@ static DWORD CALLBACK bus_main_thread(void *args)
         {
             struct device_desc desc = event->device_created.desc;
             USAGE_AND_PAGE usages;
+            BOOL hidraw;
 
             usages = get_device_usages(event->device);
-            if (!desc.is_hidraw != !is_hidraw_enabled(desc.vid, desc.pid, &usages))
+            hidraw = is_hidraw_enabled(desc.vid, desc.pid, &usages);
+            /* nothing else can serve an evdev/SDL device without a usable hidraw node */
+            if (!desc.is_hidraw && !desc.hidraw_available) hidraw = FALSE;
+            if (!desc.is_hidraw != !hidraw)
             {
                 struct device_remove_params params = {.device = event->device};
                 WARN("ignoring %shidraw device %04x:%04x with usages %04x:%04x\n", desc.is_hidraw ? "" : "non-",
