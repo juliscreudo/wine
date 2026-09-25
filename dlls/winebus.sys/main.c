@@ -257,6 +257,7 @@ static WCHAR *get_hardware_ids(DEVICE_OBJECT *device)
 static WCHAR *get_compatible_ids(DEVICE_OBJECT *device)
 {
     static const WCHAR xinput_compat[] = L"WINEBUS\\WINE_COMP_XINPUT";
+    static const WCHAR hidraw_compat[] = L"WINEBUS\\WINE_COMP_HIDRAW";
     static const WCHAR hid_compat[] = L"WINEBUS\\WINE_COMP_HID";
     struct device_extension *ext = (struct device_extension *)device->DeviceExtension;
     WCHAR usb_compat[71];
@@ -283,6 +284,7 @@ static WCHAR *get_compatible_ids(DEVICE_OBJECT *device)
 
     size = sizeof(hid_compat) + usb_len * sizeof(WCHAR);
     if (ext->desc.is_gamepad) size += sizeof(xinput_compat);
+    if (ext->desc.is_hidraw) size += sizeof(hidraw_compat);
 
     if ((dst = ExAllocatePool(PagedPool, size + sizeof(WCHAR))))
     {
@@ -291,6 +293,12 @@ static WCHAR *get_compatible_ids(DEVICE_OBJECT *device)
         {
             memcpy(pos, xinput_compat, sizeof(xinput_compat));
             pos += sizeof(xinput_compat) / sizeof(WCHAR);
+        }
+        /* lets joy.cpl tell which backend serves a device; nothing binds on it */
+        if (ext->desc.is_hidraw)
+        {
+            memcpy(pos, hidraw_compat, sizeof(hidraw_compat));
+            pos += sizeof(hidraw_compat) / sizeof(WCHAR);
         }
         memcpy(pos, hid_compat, sizeof(hid_compat));
         pos += sizeof(hid_compat) / sizeof(WCHAR);
