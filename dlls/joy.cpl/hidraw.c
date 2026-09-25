@@ -211,6 +211,69 @@ static INT get_device_override( USHORT vid, USHORT pid, BOOL vendor_wide )
     return override;
 }
 
+static void set_device_override( USHORT vid, USHORT pid, INT override )
+{
+    WCHAR path[ARRAY_SIZE(winebus_key) + 32];
+    DWORD value = override;
+    HKEY key;
+
+    swprintf( path, ARRAY_SIZE(path), L"%s\\Devices\\%04X/%04X", winebus_key, vid, pid );
+    if (override < 0)
+    {
+        RegDeleteKeyW( HKEY_LOCAL_MACHINE, path );
+        return;
+    }
+    if (RegCreateKeyExW( HKEY_LOCAL_MACHINE, path, 0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL )) return;
+    RegSetValueExW( key, L"Hidraw", 0, REG_DWORD, (BYTE *)&value, sizeof(value) );
+    RegCloseKey( key );
+}
+
+static struct hid_device *get_selected_device( HWND hwnd )
+{
+    HWND list = GetDlgItem( hwnd, IDC_HID_LIST );
+    LVITEMW item = {.mask = LVIF_PARAM};
+
+    if ((item.iItem = SendMessageW( list, LVM_GETNEXTITEM, -1, LVNI_SELECTED )) < 0) return NULL;
+    if (!SendMessageW( list, LVM_GETITEMW, 0, (LPARAM)&item )) return NULL;
+    return (struct hid_device *)item.lParam;
+}
+
+static void update_override_controls( HWND hwnd )
+{
+    static const UINT ids[] = {IDC_HID_DEFAULT, IDC_HID_HIDRAW, IDC_HID_EVDEV};
+    struct hid_device *device = get_selected_device( hwnd );
+    INT override = -1;
+    UINT i, checked;
+
+    if (device) override = get_device_override( device->vid, device->pid, FALSE );
+    checked = override < 0 ? IDC_HID_DEFAULT : override ? IDC_HID_HIDRAW : IDC_HID_EVDEV;
+
+    for (i = 0; i < ARRAY_SIZE(ids); i++)
+    {
+        EnableWindow( GetDlgItem( hwnd, ids[i] ), !!device );
+        CheckDlgButton( hwnd, ids[i], device && ids[i] == checked ? BST_CHECKED : BST_UNCHECKED );
+    }
+}
+
+static void select_device( HWND hwnd, USHORT vid, USHORT pid )
+{
+    HWND list = GetDlgItem( hwnd, IDC_HID_LIST );
+    LVITEMW item = {.mask = LVIF_PARAM};
+    struct hid_device *device;
+    INT count = SendMessageW( list, LVM_GETITEMCOUNT, 0, 0 );
+
+    for (item.iItem = 0; item.iItem < count; item.iItem++)
+    {
+        if (!SendMessageW( list, LVM_GETITEMW, 0, (LPARAM)&item )) continue;
+        device = (struct hid_device *)item.lParam;
+        if (device->vid != vid || device->pid != pid) continue;
+        item.mask = LVIF_STATE;
+        item.state = item.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
+        SendMessageW( list, LVM_SETITEMSTATE, item.iItem, (LPARAM)&item );
+        return;
+    }
+}
+
 static const WCHAR *usage_name( USAGE page, USAGE usage, WCHAR *buffer, SIZE_T len )
 {
     if (page >= 0xff00) return L"Vendor defined";
@@ -239,6 +302,15 @@ static void refresh_hid_list( HWND hwnd )
     WCHAR buffer[64];
     LVITEMW item = {.mask = LVIF_TEXT | LVIF_PARAM};
     INT override, index = 0;
+    USHORT selected_vid = 0, selected_pid = 0;
+    BOOL had_selection;
+
+    /* a backend switch re-creates the device, keep it selected by VID/PID */
+    if ((had_selection = !!(device = get_selected_device( hwnd ))))
+    {
+        selected_vid = device->vid;
+        selected_pid = device->pid;
+    }
 
     enum_hid_devices();
 
@@ -272,7 +344,9 @@ static void refresh_hid_list( HWND hwnd )
         SendMessageW( list, LVM_SETITEMTEXTW, item.iItem, (LPARAM)&item );
     }
 
+    if (had_selection) select_device( hwnd, selected_vid, selected_pid );
     SendMessageW( list, WM_SETREDRAW, TRUE, 0 );
+    update_override_controls( hwnd );
 }
 
 static void init_hid_list( HWND hwnd )
@@ -301,6 +375,8 @@ INT_PTR CALLBACK hidraw_dialog_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM 
         .dbcc_size = sizeof(DEV_BROADCAST_DEVICEINTERFACE_W),
         .dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE,
     };
+    struct hid_device *device;
+    INT override;
 
     TRACE( "hwnd %p, msg %#x, wparam %#Ix, lparam %#Ix\n", hwnd, msg, wparam, lparam );
 
@@ -320,6 +396,25 @@ INT_PTR CALLBACK hidraw_dialog_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM 
 
     case WM_TIMER:
         KillTimer( hwnd, wparam );
+        refresh_hid_list( hwnd );
+        return TRUE;
+
+    case WM_NOTIFY:
+        if (((NMHDR *)lparam)->idFrom == IDC_HID_LIST && ((NMHDR *)lparam)->code == LVN_ITEMCHANGED)
+            update_override_controls( hwnd );
+        return TRUE;
+
+    case WM_COMMAND:
+        if (HIWORD(wparam) != BN_CLICKED) return FALSE;
+        switch (LOWORD(wparam))
+        {
+        case IDC_HID_DEFAULT: override = -1; break;
+        case IDC_HID_HIDRAW: override = 1; break;
+        case IDC_HID_EVDEV: override = 0; break;
+        default: return FALSE;
+        }
+        if (!(device = get_selected_device( hwnd ))) return TRUE;
+        set_device_override( device->vid, device->pid, override );
         refresh_hid_list( hwnd );
         return TRUE;
 

@@ -121,6 +121,10 @@ FONT 8, "Ms Shell Dlg"
 {
     LTEXT           "Devices exposed by winebus and the backend serving each one", IDC_STATIC, 10, 10, 300, 10
     CONTROL         "", IDC_HID_LIST, "SysListView32", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP, 10, 22, 300, 150
+    GROUPBOX        "Backend for the selected device (takes effect immediately)", IDC_HID_GROUP, 10, 180, 300, 52
+    AUTORADIOBUTTON "&Default", IDC_HID_DEFAULT, 20, 194, 120, 10, WS_GROUP | WS_TABSTOP
+    AUTORADIOBUTTON "&hidraw (the device's own report descriptor)", IDC_HID_HIDRAW, 20, 206, 250, 10
+    AUTORADIOBUTTON "&SDL / evdev", IDC_HID_EVDEV, 20, 218, 120, 10
 }
 
 LANGUAGE LANG_NEUTRAL, SUBLANG_NEUTRAL
