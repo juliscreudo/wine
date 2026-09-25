@@ -225,14 +225,17 @@ extern void *hid_device_create(const struct hid_device_vtbl *vtbl, SIZE_T size);
 extern NTSTATUS sdl_bus_init(void *);
 extern NTSTATUS sdl_bus_wait(void *);
 extern NTSTATUS sdl_bus_stop(void *);
+extern NTSTATUS sdl_bus_rescan(void *);
 
 extern NTSTATUS udev_bus_init(void *);
 extern NTSTATUS udev_bus_wait(void *);
 extern NTSTATUS udev_bus_stop(void *);
+extern NTSTATUS udev_bus_rescan(void *);
 
 extern NTSTATUS iohid_bus_init(void *);
 extern NTSTATUS iohid_bus_wait(void *);
 extern NTSTATUS iohid_bus_stop(void *);
+extern NTSTATUS iohid_bus_rescan(void *);
 
 extern void bus_event_cleanup(struct bus_event *event);
 extern void bus_event_queue_destroy(struct list *queue);

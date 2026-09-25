@@ -64,6 +64,7 @@ static const struct bus_options *options;
 
 static void *sdl_handle = NULL;
 static UINT quit_event = -1;
+static UINT rescan_event = -1;
 static struct list event_queue = LIST_INIT(event_queue);
 static struct list device_list = LIST_INIT(device_list);
 
@@ -78,6 +79,8 @@ MAKE_FUNCPTR(SDL_JoystickInstanceID);
 MAKE_FUNCPTR(SDL_JoystickName);
 MAKE_FUNCPTR(SDL_JoystickNumAxes);
 MAKE_FUNCPTR(SDL_JoystickOpen);
+MAKE_FUNCPTR(SDL_NumJoysticks);
+MAKE_FUNCPTR(SDL_JoystickGetDeviceInstanceID);
 MAKE_FUNCPTR(SDL_WaitEventTimeout);
 MAKE_FUNCPTR(SDL_JoystickNumButtons);
 MAKE_FUNCPTR(SDL_JoystickNumBalls);
@@ -1027,6 +1030,22 @@ static void sdl_add_device(unsigned int index)
     while (axis_offset < axis_count);
 }
 
+/* Offer every joystick the bus does not already hold. A joystick rejected by
+ * the hidraw gate was closed, so it comes back through sdl_add_device and gets
+ * a fresh decision. */
+static void sdl_rescan_devices(void)
+{
+    int i, count = pSDL_NumJoysticks();
+    SDL_JoystickID id;
+
+    for (i = 0; i < count; i++)
+    {
+        if ((id = pSDL_JoystickGetDeviceInstanceID(i)) < 0) continue;
+        if (find_device_from_id(id)) continue;
+        sdl_add_device(i);
+    }
+}
+
 static void process_device_event(SDL_Event *event)
 {
     struct sdl_device *impl;
@@ -1036,7 +1055,9 @@ static void process_device_event(SDL_Event *event)
 
     pthread_mutex_lock(&sdl_cs);
 
-    if (event->type == SDL_JOYDEVICEADDED)
+    if (event->type == rescan_event)
+        sdl_rescan_devices();
+    else if (event->type == SDL_JOYDEVICEADDED)
         sdl_add_device(((SDL_JoyDeviceEvent *)event)->which);
     else if (event->type == SDL_JOYDEVICEREMOVED)
     {
@@ -1107,6 +1128,8 @@ NTSTATUS sdl_bus_init(void *args)
     LOAD_FUNCPTR(SDL_JoystickName);
     LOAD_FUNCPTR(SDL_JoystickNumAxes);
     LOAD_FUNCPTR(SDL_JoystickOpen);
+    LOAD_FUNCPTR(SDL_NumJoysticks);
+    LOAD_FUNCPTR(SDL_JoystickGetDeviceInstanceID);
     LOAD_FUNCPTR(SDL_WaitEventTimeout);
     LOAD_FUNCPTR(SDL_JoystickNumButtons);
     LOAD_FUNCPTR(SDL_JoystickNumBalls);
@@ -1160,11 +1183,12 @@ NTSTATUS sdl_bus_init(void *args)
         goto failed;
     }
 
-    if ((quit_event = pSDL_RegisterEvents(1)) == -1)
+    if ((quit_event = pSDL_RegisterEvents(2)) == -1)
     {
         ERR("error registering quit event\n");
         goto failed;
     }
+    rescan_event = quit_event + 1;
 
     pSDL_JoystickEventState(SDL_ENABLE);
     pSDL_GameControllerEventState(SDL_ENABLE);
@@ -1232,6 +1256,22 @@ NTSTATUS sdl_bus_stop(void *args)
     return STATUS_SUCCESS;
 }
 
+NTSTATUS sdl_bus_rescan(void *args)
+{
+    SDL_Event event;
+
+    if (!sdl_handle) return STATUS_SUCCESS;
+
+    event.type = rescan_event;
+    if (pSDL_PushEvent(&event) != 1)
+    {
+        ERR("error pushing rescan event\n");
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    return STATUS_SUCCESS;
+}
+
 #else
 
 NTSTATUS sdl_bus_init(void *args)
@@ -1247,6 +1287,12 @@ NTSTATUS sdl_bus_wait(void *args)
 }
 
 NTSTATUS sdl_bus_stop(void *args)
+{
+    WARN("SDL support not compiled in!\n");
+    return STATUS_NOT_IMPLEMENTED;
+}
+
+NTSTATUS sdl_bus_rescan(void *args)
 {
     WARN("SDL support not compiled in!\n");
     return STATUS_NOT_IMPLEMENTED;

@@ -1379,6 +1379,14 @@ static void udev_add_device(struct udev_device *dev, int fd)
         return;
     }
 
+    /* rescans and udev "change" events offer nodes the bus already holds */
+    if (find_device_from_devnode(devnode))
+    {
+        TRACE("udev %s already known, ignoring\n", debugstr_a(devnode));
+        if (fd >= 0) close(fd);
+        return;
+    }
+
     if (fd < 0 && (fd = open(devnode, O_RDWR)) == -1)
     {
         WARN("Unable to open udev device %s: %s\n", debugstr_a(devnode), strerror(errno));
@@ -1862,6 +1870,13 @@ NTSTATUS udev_bus_wait(void *args)
 #endif
         }
         if (pfd[1].revents) read(deviceloop_control[0], &ctrl, 1);
+        if (ctrl == 'r')
+        {
+            /* re-offer nodes rejected earlier; udev_add_device skips known ones */
+            if (udev_monitor) build_initial_deviceset_udevd();
+            else build_initial_deviceset_direct();
+            ctrl = 0;
+        }
         for (i = 2; i < count; ++i)
         {
             if (!pfd[i].revents) continue;
@@ -1888,6 +1903,13 @@ NTSTATUS udev_bus_stop(void *args)
     return STATUS_SUCCESS;
 }
 
+NTSTATUS udev_bus_rescan(void *args)
+{
+    if (!udev_context) return STATUS_SUCCESS;
+    write(deviceloop_control[1], "r", 1);
+    return STATUS_SUCCESS;
+}
+
 #else
 
 NTSTATUS udev_bus_init(void *args)
@@ -1903,6 +1925,12 @@ NTSTATUS udev_bus_wait(void *args)
 }
 
 NTSTATUS udev_bus_stop(void *args)
+{
+    WARN("UDEV support not compiled in!\n");
+    return STATUS_NOT_IMPLEMENTED;
+}
+
+NTSTATUS udev_bus_rescan(void *args)
 {
     WARN("UDEV support not compiled in!\n");
     return STATUS_NOT_IMPLEMENTED;

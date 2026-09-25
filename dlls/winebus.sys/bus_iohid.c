@@ -406,6 +406,11 @@ NTSTATUS iohid_bus_stop(void *args)
     return STATUS_SUCCESS;
 }
 
+NTSTATUS iohid_bus_rescan(void *args)
+{
+    return STATUS_SUCCESS;
+}
+
 #else
 
 NTSTATUS iohid_bus_init(void *args)
@@ -421,6 +426,12 @@ NTSTATUS iohid_bus_wait(void *args)
 }
 
 NTSTATUS iohid_bus_stop(void *args)
+{
+    WARN("IOHID support not compiled in!\n");
+    return STATUS_NOT_IMPLEMENTED;
+}
+
+NTSTATUS iohid_bus_rescan(void *args)
 {
     WARN("IOHID support not compiled in!\n");
     return STATUS_NOT_IMPLEMENTED;
