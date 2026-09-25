@@ -308,6 +308,82 @@ static void set_device_override( USHORT vid, USHORT pid, INT override )
     RegCloseKey( key );
 }
 
+/* Standard property sheet flow: a radio click only records the change,
+ * Apply and OK write every pending override at once, Cancel drops them. */
+struct pending_override
+{
+    struct list entry;
+    USHORT vid, pid;
+    INT override;
+};
+
+static struct list pending_overrides = LIST_INIT( pending_overrides );
+
+static struct pending_override *find_pending( USHORT vid, USHORT pid )
+{
+    struct pending_override *pending;
+
+    LIST_FOR_EACH_ENTRY( pending, &pending_overrides, struct pending_override, entry )
+        if (pending->vid == vid && pending->pid == pid) return pending;
+    return NULL;
+}
+
+static void clear_pending(void)
+{
+    struct pending_override *pending, *next;
+
+    LIST_FOR_EACH_ENTRY_SAFE( pending, next, &pending_overrides, struct pending_override, entry )
+    {
+        list_remove( &pending->entry );
+        free( pending );
+    }
+}
+
+static void set_pending( HWND hwnd, USHORT vid, USHORT pid, INT override )
+{
+    struct pending_override *pending = find_pending( vid, pid );
+
+    if (override == get_device_override( vid, pid, FALSE ))
+    {
+        if (pending)
+        {
+            list_remove( &pending->entry );
+            free( pending );
+        }
+    }
+    else
+    {
+        if (!pending && (pending = calloc( 1, sizeof(*pending) )))
+        {
+            pending->vid = vid;
+            pending->pid = pid;
+            list_add_tail( &pending_overrides, &pending->entry );
+        }
+        if (pending) pending->override = override;
+    }
+
+    if (list_empty( &pending_overrides )) SendMessageW( GetParent( hwnd ), PSM_UNCHANGED, (WPARAM)hwnd, 0 );
+    else SendMessageW( GetParent( hwnd ), PSM_CHANGED, (WPARAM)hwnd, 0 );
+}
+
+static void apply_pending(void)
+{
+    struct pending_override *pending;
+
+    LIST_FOR_EACH_ENTRY( pending, &pending_overrides, struct pending_override, entry )
+        set_device_override( pending->vid, pending->pid, pending->override );
+    clear_pending();
+}
+
+/* Effective choice for a device: pending change if any, else the registry. */
+static INT get_effective_override( USHORT vid, USHORT pid, BOOL *is_pending )
+{
+    struct pending_override *pending = find_pending( vid, pid );
+
+    if (is_pending) *is_pending = !!pending;
+    return pending ? pending->override : get_device_override( vid, pid, FALSE );
+}
+
 static struct hid_device *get_selected_device( HWND hwnd )
 {
     HWND list = GetDlgItem( hwnd, IDC_HID_LIST );
@@ -393,7 +469,7 @@ static void update_override_controls( HWND hwnd )
 
     if (device)
     {
-        override = get_device_override( device->vid, device->pid, FALSE );
+        override = get_effective_override( device->vid, device->pid, NULL );
         describe_device( device, override, text, ARRAY_SIZE(text) );
     }
     checked = override < 0 ? IDC_HID_DEFAULT : override ? IDC_HID_HIDRAW : IDC_HID_EVDEV;
@@ -458,7 +534,7 @@ static void refresh_hid_list( HWND hwnd )
     LVITEMW item = {.mask = LVIF_TEXT | LVIF_PARAM};
     INT override, index = 0;
     USHORT selected_vid = 0, selected_pid = 0;
-    BOOL had_selection;
+    BOOL had_selection, pending;
 
     /* a backend switch re-creates the device, keep it selected by VID/PID */
     if ((had_selection = !!(device = get_selected_device( hwnd ))))
@@ -493,9 +569,12 @@ static void refresh_hid_list( HWND hwnd )
         item.pszText = (WCHAR *)(!device->present ? L"none" : device->hidraw ? L"hidraw" : L"SDL / evdev");
         SendMessageW( list, LVM_SETITEMTEXTW, item.iItem, (LPARAM)&item );
 
-        override = get_device_override( device->vid, device->pid, FALSE );
+        override = get_effective_override( device->vid, device->pid, &pending );
+        swprintf( buffer, ARRAY_SIZE(buffer), L"%s%s",
+                  override < 0 ? (pending ? L"Default" : L"") : override ? L"hidraw" : L"SDL / evdev",
+                  pending ? L" (pending)" : L"" );
         item.iSubItem = 4;
-        item.pszText = (WCHAR *)(override < 0 ? L"" : override ? L"hidraw" : L"SDL / evdev");
+        item.pszText = buffer;
         SendMessageW( list, LVM_SETITEMTEXTW, item.iItem, (LPARAM)&item );
     }
 
@@ -555,9 +634,23 @@ INT_PTR CALLBACK hidraw_dialog_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM 
         return TRUE;
 
     case WM_NOTIFY:
-        if (((NMHDR *)lparam)->idFrom == IDC_HID_LIST && ((NMHDR *)lparam)->code == LVN_ITEMCHANGED)
-            update_override_controls( hwnd );
+    {
+        NMHDR *hdr = (NMHDR *)lparam;
+
+        if (hdr->idFrom == IDC_HID_LIST && hdr->code == LVN_ITEMCHANGED) update_override_controls( hwnd );
+        else if (hdr->code == PSN_APPLY)
+        {
+            apply_pending();
+            refresh_hid_list( hwnd );
+            SetWindowLongPtrW( hwnd, DWLP_MSGRESULT, PSNRET_NOERROR );
+        }
+        else if (hdr->code == PSN_RESET)
+        {
+            clear_pending();
+            refresh_hid_list( hwnd );
+        }
         return TRUE;
+    }
 
     case WM_COMMAND:
         if (HIWORD(wparam) != BN_CLICKED) return FALSE;
@@ -569,11 +662,12 @@ INT_PTR CALLBACK hidraw_dialog_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM 
         default: return FALSE;
         }
         if (!(device = get_selected_device( hwnd ))) return TRUE;
-        set_device_override( device->vid, device->pid, override );
+        set_pending( hwnd, device->vid, device->pid, override );
         refresh_hid_list( hwnd );
         return TRUE;
 
     case WM_DESTROY:
+        clear_pending();
         clear_hid_devices();
         return TRUE;
     }
