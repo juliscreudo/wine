@@ -296,29 +296,7 @@ static BOOL install_device_driver( DEVICE_OBJECT *device, HDEVINFO set, SP_DEVIN
     };
     static const DWORD config_flags = 0;
 
-    NTSTATUS status;
     unsigned int i;
-    WCHAR *ids;
-
-    if ((status = get_device_id( device, BusQueryHardwareIDs, &ids )) || !ids)
-    {
-        ERR("Failed to get hardware IDs, status %#lx.\n", status);
-        return FALSE;
-    }
-
-    SetupDiSetDeviceRegistryPropertyW( set, sp_device, SPDRP_HARDWAREID, (BYTE *)ids,
-            sizeof_multiszW( ids ) * sizeof(WCHAR) );
-    ExFreePool( ids );
-
-    if ((status = get_device_id( device, BusQueryCompatibleIDs, &ids )) || !ids)
-    {
-        ERR("Failed to get compatible IDs, status %#lx.\n", status);
-        return FALSE;
-    }
-
-    SetupDiSetDeviceRegistryPropertyW( set, sp_device, SPDRP_COMPATIBLEIDS, (BYTE *)ids,
-            sizeof_multiszW( ids ) * sizeof(WCHAR) );
-    ExFreePool( ids );
 
     /* Set the config flags. setupapi won't do this for us if we couldn't find
      * a driver to install, but raw devices should still have this key
@@ -449,6 +427,26 @@ static void enumerate_new_device( DEVICE_OBJECT *device, HDEVINFO set, DEVICE_OB
     {
         SetupDiSetDeviceRegistryPropertyW( set, &sp_device, SPDRP_BASE_CONTAINERID, (BYTE *)id,
             (lstrlenW( id ) + 1) * sizeof(WCHAR) );
+        ExFreePool( id );
+    }
+
+    /* Refreshed on every enumeration, like the other bus-reported properties,
+     * so a devnode installed by an older driver does not keep stale IDs. */
+    if ((status = get_device_id( device, BusQueryHardwareIDs, &id )) || !id)
+        ERR("Failed to get hardware IDs for device %s, status %#lx.\n", debugstr_w(device_instance_id), status);
+    else
+    {
+        SetupDiSetDeviceRegistryPropertyW( set, &sp_device, SPDRP_HARDWAREID, (BYTE *)id,
+                sizeof_multiszW( id ) * sizeof(WCHAR) );
+        ExFreePool( id );
+    }
+
+    if ((status = get_device_id( device, BusQueryCompatibleIDs, &id )) || !id)
+        ERR("Failed to get compatible IDs for device %s, status %#lx.\n", debugstr_w(device_instance_id), status);
+    else
+    {
+        SetupDiSetDeviceRegistryPropertyW( set, &sp_device, SPDRP_COMPATIBLEIDS, (BYTE *)id,
+                sizeof_multiszW( id ) * sizeof(WCHAR) );
         ExFreePool( id );
     }
 
