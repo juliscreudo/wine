@@ -238,14 +238,59 @@ static struct hid_device *get_selected_device( HWND hwnd )
     return (struct hid_device *)item.lParam;
 }
 
+/* The older EnableHidraw list, a REG_MULTI_SZ of VVVV:PPPP entries that
+ * community scripts still write. Left alone here, shown so the user knows
+ * why a device is on hidraw. */
+static BOOL is_hidraw_forced( USHORT vid, USHORT pid )
+{
+    WCHAR vidpid[16], list[2048], *entry;
+    DWORD size = sizeof(list);
+    HKEY key;
+
+    if (RegOpenKeyExW( HKEY_LOCAL_MACHINE, winebus_key, 0, KEY_READ, &key )) return FALSE;
+    if (RegQueryValueExW( key, L"EnableHidraw", NULL, NULL, (BYTE *)list, &size )) size = 0;
+    RegCloseKey( key );
+    if (size < 2 * sizeof(WCHAR)) return FALSE;
+    list[size / sizeof(WCHAR) - 1] = 0;
+
+    swprintf( vidpid, ARRAY_SIZE(vidpid), L"%04X:%04X", vid, pid );
+    for (entry = list; *entry; entry += wcslen( entry ) + 1)
+        if (!wcsnicmp( entry, vidpid, 9 )) return TRUE;
+    return FALSE;
+}
+
+/* Mirrors the precedence in winebus: the per-device key, then a vendor-wide
+ * Devices\VVVV key, then EnableHidraw, then the usage of the device. */
+static void describe_device( const struct hid_device *device, INT override, WCHAR *text, SIZE_T len )
+{
+    INT vendor = get_device_override( device->vid, device->pid, TRUE );
+
+    if (override >= 0)
+        swprintf( text, len, L"Per-device override for %04X:%04X. Default lets winebus decide again.",
+                  device->vid, device->pid );
+    else if (vendor >= 0)
+        swprintf( text, len, L"Forced to %s by a vendor-wide Devices\\%04X registry key (read-only here).",
+                  vendor ? L"hidraw" : L"SDL / evdev", device->vid );
+    else if (is_hidraw_forced( device->vid, device->pid ))
+        swprintf( text, len, L"Forced to hidraw by the EnableHidraw registry list (read-only here)." );
+    else
+        swprintf( text, len, L"Default: gamepads go through SDL / evdev, every other HID device through hidraw. "
+                             L"A device without a readable hidraw node stays on SDL / evdev." );
+}
+
 static void update_override_controls( HWND hwnd )
 {
     static const UINT ids[] = {IDC_HID_DEFAULT, IDC_HID_HIDRAW, IDC_HID_EVDEV};
     struct hid_device *device = get_selected_device( hwnd );
+    WCHAR text[256] = L"Select a device to choose the backend it is served through.";
     INT override = -1;
     UINT i, checked;
 
-    if (device) override = get_device_override( device->vid, device->pid, FALSE );
+    if (device)
+    {
+        override = get_device_override( device->vid, device->pid, FALSE );
+        describe_device( device, override, text, ARRAY_SIZE(text) );
+    }
     checked = override < 0 ? IDC_HID_DEFAULT : override ? IDC_HID_HIDRAW : IDC_HID_EVDEV;
 
     for (i = 0; i < ARRAY_SIZE(ids); i++)
@@ -253,6 +298,7 @@ static void update_override_controls( HWND hwnd )
         EnableWindow( GetDlgItem( hwnd, ids[i] ), !!device );
         CheckDlgButton( hwnd, ids[i], device && ids[i] == checked ? BST_CHECKED : BST_UNCHECKED );
     }
+    SetDlgItemTextW( hwnd, IDC_HID_INFO, text );
 }
 
 static void select_device( HWND hwnd, USHORT vid, USHORT pid )
