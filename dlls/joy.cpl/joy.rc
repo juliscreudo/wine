@@ -114,6 +114,15 @@ FONT 8, "Ms Shell Dlg"
     AUTOCHECKBOX    "Rumble", IDC_WGI_RUMBLE, 260, 30, 40, 10
 }
 
+IDD_HIDRAW DIALOG 0, 0, 320, 300
+STYLE WS_CAPTION | WS_CHILD | WS_DISABLED
+CAPTION "HID devices"
+FONT 8, "Ms Shell Dlg"
+{
+    LTEXT           "Devices exposed by winebus and the backend serving each one", IDC_STATIC, 10, 10, 300, 10
+    CONTROL         "", IDC_HID_LIST, "SysListView32", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP, 10, 22, 300, 150
+}
+
 LANGUAGE LANG_NEUTRAL, SUBLANG_NEUTRAL
 
 /* @makedep: joy.manifest */

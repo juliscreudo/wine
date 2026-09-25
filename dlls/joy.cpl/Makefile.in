@@ -1,5 +1,5 @@
 MODULE    = joy.cpl
-IMPORTS   = dxguid dinput dinput8 ole32 comctl32 user32 gdi32 advapi32 xinput combase
+IMPORTS   = dxguid dinput dinput8 ole32 comctl32 user32 gdi32 advapi32 xinput combase hid setupapi
 
 EXTRADLLFLAGS = -Wb,--prefer-native
 
@@ -7,6 +7,7 @@ VER_FILEDESCRIPTION_STR = "Game Controllers Configuration Panel"
 
 SOURCES = \
 	dinput.c \
+	hidraw.c \
 	joy.rc \
 	joy.svg \
 	main.c \

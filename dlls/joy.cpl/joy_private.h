@@ -50,4 +50,6 @@ extern LRESULT CALLBACK test_wgi_povs_window_proc( HWND hwnd, UINT msg, WPARAM w
 extern LRESULT CALLBACK test_wgi_buttons_window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam );
 extern LRESULT CALLBACK test_wgi_gamepad_window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam );
 
+extern INT_PTR CALLBACK hidraw_dialog_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam );
+
 #endif /* __JOY_PRIVATE_H */
