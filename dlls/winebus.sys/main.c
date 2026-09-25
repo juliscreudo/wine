@@ -919,8 +919,24 @@ static USAGE_AND_PAGE get_device_usages(UINT64 unix_device)
 
     if (!get_device_descriptors(unix_device, &report_desc, &report_desc_length, &device_desc))
     {
-        usages.UsagePage = device_desc.CollectionDesc[0].UsagePage;
-        usages.Usage = device_desc.CollectionDesc[0].Usage;
+        HIDP_COLLECTION_DESC *desc = device_desc.CollectionDesc;
+        UINT i;
+
+        /* Composite devices often lead with a keyboard or mouse collection
+         * that the gate rejects; decide on the first one it can take. */
+        usages.UsagePage = desc[0].UsagePage;
+        usages.Usage = desc[0].Usage;
+        for (i = 0; i < device_desc.CollectionDescLength; i++)
+        {
+            if (desc[i].UsagePage == HID_USAGE_PAGE_DIGITIZER) continue;
+            if (desc[i].UsagePage == HID_USAGE_PAGE_GENERIC &&
+                (desc[i].Usage == HID_USAGE_GENERIC_MOUSE || desc[i].Usage == HID_USAGE_GENERIC_KEYBOARD))
+                continue;
+            usages.UsagePage = desc[i].UsagePage;
+            usages.Usage = desc[i].Usage;
+            break;
+        }
+
         HidP_FreeCollectionDescription(&device_desc);
         RtlFreeHeap(GetProcessHeap(), 0, report_desc);
     }
