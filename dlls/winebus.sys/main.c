@@ -80,6 +80,7 @@ struct device_extension
     enum device_state state;
 
     struct device_desc desc;
+    USAGE_AND_PAGE usages; /* top-level collection, as seen by the hidraw gate */
     GUID container_id;
     DWORD index;
 
@@ -103,6 +104,16 @@ static CRITICAL_SECTION_DEBUG critsect_debug =
       0, 0, { (DWORD_PTR)(__FILE__ ": device_list_cs") }
 };
 static CRITICAL_SECTION device_list_cs = { &critsect_debug, -1, 0, 0, 0, 0 };
+
+/* guards options.devices, which the reload swaps while the bus threads read it */
+static CRITICAL_SECTION options_cs;
+static CRITICAL_SECTION_DEBUG options_cs_debug =
+{
+    0, 0, &options_cs,
+    { &options_cs_debug.ProcessLocksList, &options_cs_debug.ProcessLocksList },
+      0, 0, { (DWORD_PTR)(__FILE__ ": options_cs") }
+};
+static CRITICAL_SECTION options_cs = { &options_cs_debug, -1, 0, 0, 0, 0 };
 
 static struct list device_list = LIST_INIT(device_list);
 
@@ -477,8 +488,10 @@ static void bus_unlink_hid_device(DEVICE_OBJECT *device)
 {
     struct device_extension *ext = (struct device_extension *)device->DeviceExtension;
 
+    /* called once when the device vanishes and again from IRP_MN_REMOVE_DEVICE */
     RtlEnterCriticalSection(&device_list_cs);
     list_remove(&ext->entry);
+    list_init(&ext->entry);
     RtlLeaveCriticalSection(&device_list_cs);
 }
 
@@ -575,16 +588,21 @@ static BOOL is_hidraw_forced(WORD vid, WORD pid)
 static BOOL is_hidraw_enabled(WORD vid, WORD pid, const USAGE_AND_PAGE *usages)
 {
     struct device_options *device;
+    INT override = -1;
 
     if (options.disable_hidraw) return FALSE;
 
+    RtlEnterCriticalSection(&options_cs);
     LIST_FOR_EACH_ENTRY(device, &options.devices, struct device_options, entry)
     {
         if (device->vid != vid) continue;
         if (device->pid != -1 && device->pid != pid) continue;
         if (device->hidraw == -1) continue;
-        return !!device->hidraw;
+        override = device->hidraw;
+        break;
     }
+    RtlLeaveCriticalSection(&options_cs);
+    if (override != -1) return !!override;
 
     if (is_hidraw_forced(vid, pid)) return TRUE;
 
@@ -606,6 +624,17 @@ static BOOL is_hidraw_enabled(WORD vid, WORD pid, const USAGE_AND_PAGE *usages)
     if (is_dualsense_gamepad(vid, pid)) return TRUE;
 
     return FALSE;
+}
+
+/* Whether the bus keeps a device as offered by its backend. */
+static BOOL is_device_accepted(const struct device_desc *desc, const USAGE_AND_PAGE *usages)
+{
+    BOOL hidraw = is_hidraw_enabled(desc->vid, desc->pid, usages);
+
+    /* nothing else can serve an evdev/SDL device without a usable hidraw node */
+    if (!desc->is_hidraw && !desc->hidraw_available) hidraw = FALSE;
+
+    return !desc->is_hidraw == !hidraw;
 }
 
 static BOOL deliver_next_report(struct device_extension *ext, IRP *irp)
@@ -946,13 +975,9 @@ static DWORD CALLBACK bus_main_thread(void *args)
         {
             struct device_desc desc = event->device_created.desc;
             USAGE_AND_PAGE usages;
-            BOOL hidraw;
 
             usages = get_device_usages(event->device);
-            hidraw = is_hidraw_enabled(desc.vid, desc.pid, &usages);
-            /* nothing else can serve an evdev/SDL device without a usable hidraw node */
-            if (!desc.is_hidraw && !desc.hidraw_available) hidraw = FALSE;
-            if (!desc.is_hidraw != !hidraw)
+            if (!is_device_accepted(&desc, &usages))
             {
                 struct device_remove_params params = {.device = event->device};
                 WARN("ignoring %shidraw device %04x:%04x with usages %04x:%04x\n", desc.is_hidraw ? "" : "non-",
@@ -965,7 +990,11 @@ static DWORD CALLBACK bus_main_thread(void *args)
                   desc.vid, desc.pid, usages.UsagePage, usages.Usage);
 
             device = bus_create_hid_device(&event->device_created.desc, event->device);
-            if (device) IoInvalidateDeviceRelations(bus_pdo, BusRelations);
+            if (device)
+            {
+                ((struct device_extension *)device->DeviceExtension)->usages = usages;
+                IoInvalidateDeviceRelations(bus_pdo, BusRelations);
+            }
             else
             {
                 struct device_remove_params params = {.device = event->device};
@@ -1101,11 +1130,11 @@ done:
     NtClose(key);
 }
 
-static struct device_options *add_device_options(UINT vid, UINT pid)
+static struct device_options *add_device_options(struct list *devices, UINT vid, UINT pid)
 {
     struct device_options *device, *next;
 
-    LIST_FOR_EACH_ENTRY(device, &options.devices, struct device_options, entry)
+    LIST_FOR_EACH_ENTRY(device, devices, struct device_options, entry)
         if (device->vid == vid && device->pid == pid) return device;
 
     if (!(device = calloc(1, sizeof(*device)))) return NULL;
@@ -1113,14 +1142,14 @@ static struct device_options *add_device_options(UINT vid, UINT pid)
     device->pid = pid;
     device->hidraw = -1;
 
-    LIST_FOR_EACH_ENTRY(next, &options.devices, struct device_options, entry)
+    LIST_FOR_EACH_ENTRY(next, devices, struct device_options, entry)
         if (next->vid > vid || (next->vid == vid && next->pid > pid)) break;
     list_add_before(&next->entry, &device->entry);
 
     return device;
 }
 
-static void load_device_options(void)
+static void load_device_options(struct list *devices)
 {
     char buffer[FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data[1024])];
     KEY_VALUE_PARTIAL_INFORMATION *info = (KEY_VALUE_PARTIAL_INFORMATION *)buffer;
@@ -1173,7 +1202,7 @@ static void load_device_options(void)
         name_buffer[(name->NameLength - pos) / sizeof(WCHAR)] = 0;
 
         if ((ret = swscanf(name_buffer, L"%04x/%04x", &vid, &pid)) < 1) continue;
-        if (!(device = add_device_options(vid, ret == 1 ? -1 : pid))) continue;
+        if (!(device = add_device_options(devices, vid, ret == 1 ? -1 : pid))) continue;
 
         if (!NtQueryValueKey(subkey, &hidraw, KeyValuePartialInformation, info, sizeof(buffer), &size) && info->Type == REG_DWORD)
             device->hidraw = *(DWORD *)info->Data;
@@ -1206,7 +1235,7 @@ static void bus_options_init(void)
         sdl_bus_load_mappings(&options);
     }
 
-    load_device_options();
+    load_device_options(&options.devices);
 }
 
 static void bus_options_cleanup(void)
@@ -1223,6 +1252,47 @@ static void bus_options_cleanup(void)
 
     memset(&options, 0, sizeof(options));
     list_init(&options.devices);
+}
+
+/* Re-reads the per-device hidraw overrides, drops the devices whose backend
+ * choice changed and asks the backends to re-offer what they hold. Only the
+ * affected devices lose their PDO: PnP removes those through
+ * IRP_MN_REMOVE_DEVICE and the rescan brings back the other side of each. */
+static void bus_options_reload(void)
+{
+    struct list devices = LIST_INIT(devices);
+    struct device_options *option, *next_option;
+    struct device_extension *ext, *next_ext;
+    BOOL changed = FALSE;
+
+    load_device_options(&devices);
+
+    RtlEnterCriticalSection(&options_cs);
+    LIST_FOR_EACH_ENTRY_SAFE(option, next_option, &options.devices, struct device_options, entry)
+    {
+        list_remove(&option->entry);
+        free(option);
+    }
+    list_move_tail(&options.devices, &devices);
+    RtlLeaveCriticalSection(&options_cs);
+
+    RtlEnterCriticalSection(&device_list_cs);
+    LIST_FOR_EACH_ENTRY_SAFE(ext, next_ext, &device_list, struct device_extension, entry)
+    {
+        if (is_device_accepted(&ext->desc, &ext->usages)) continue;
+        TRACE("dropping %shidraw device %04x:%04x\n", ext->desc.is_hidraw ? "" : "non-",
+              ext->desc.vid, ext->desc.pid);
+        list_remove(&ext->entry);
+        list_init(&ext->entry);
+        changed = TRUE;
+    }
+    RtlLeaveCriticalSection(&device_list_cs);
+
+    if (changed) IoInvalidateDeviceRelations(bus_pdo, BusRelations);
+
+    winebus_call(sdl_rescan, NULL);
+    winebus_call(udev_rescan, NULL);
+    winebus_call(iohid_rescan, NULL);
 }
 
 static NTSTATUS sdl_driver_init(void)
