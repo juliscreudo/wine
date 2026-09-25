@@ -56,6 +56,7 @@ struct hid_device
     USHORT vid, pid;
     USAGE usage_page, usage;
     BOOL hidraw;
+    BOOL hidraw_available; /* a readable hidraw node exists, so forcing hidraw can take effect */
     BOOL present;        /* served by winebus; FALSE for a node it could not open at all */
     WCHAR node[64];      /* hidraw node winebus could not open, from HKEY_DYN_DATA\WineBus\Nodes */
     WCHAR node_error[64];
@@ -117,6 +118,7 @@ static BOOL get_winebus_backend( HDEVINFO set, SP_DEVINFO_DATA *child, struct hi
 
     if (!multi_sz_contains( ids, L"WINEBUS\\WINE_COMP_HID" )) return FALSE;
     device->hidraw = multi_sz_contains( ids, L"WINEBUS\\WINE_COMP_HIDRAW" );
+    device->hidraw_available = device->hidraw || multi_sz_contains( ids, L"WINEBUS\\WINE_COMP_HIDRAW_AVAILABLE" );
     return TRUE;
 }
 
@@ -353,10 +355,16 @@ static void describe_device( const struct hid_device *device, INT override, WCHA
     }
 
     if (device->node[0])
-    {
         used = swprintf( text, len, L"Its hidraw node %s is not readable (%s), so it is served through SDL / evdev. "
                                     L"Forcing hidraw has no effect until a udev rule grants access. ",
                          device->node, device->node_error );
+    else if (!device->hidraw_available)
+        used = swprintf( text, len, L"No hidraw device exists for it (virtual device or non-HID driver), "
+                                    L"it can only be served through SDL / evdev. " );
+    else used = 0;
+
+    if (used)
+    {
         if (override < 0 && vendor < 0 && !is_hidraw_forced( device->vid, device->pid )) return;
         text += used;
         len -= used;
@@ -392,7 +400,11 @@ static void update_override_controls( HWND hwnd )
 
     for (i = 0; i < ARRAY_SIZE(ids); i++)
     {
-        EnableWindow( GetDlgItem( hwnd, ids[i] ), device && device->present );
+        BOOL enable = device && device->present;
+
+        /* hidraw cannot take effect without a readable hidraw node */
+        if (ids[i] == IDC_HID_HIDRAW && enable) enable = device->hidraw_available && !device->node[0];
+        EnableWindow( GetDlgItem( hwnd, ids[i] ), enable );
         CheckDlgButton( hwnd, ids[i], device && device->present && ids[i] == checked ? BST_CHECKED : BST_UNCHECKED );
     }
     SetDlgItemTextW( hwnd, IDC_HID_INFO, text );
