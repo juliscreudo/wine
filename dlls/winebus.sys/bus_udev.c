@@ -229,7 +229,13 @@ static void stop_polling_device(struct unix_device *iface)
     int i;
 
     if (impl->device_fd == -1) return; /* already removed */
-    if (!impl->started) return; /* not started */
+    if (!impl->started)
+    {
+        /* never entered the poll set, so nothing else can be using the fd */
+        close(impl->device_fd);
+        impl->device_fd = -1;
+        return;
+    }
     impl->started = FALSE;
 
     for (i = 2; i < poll_count; ++i)
@@ -755,14 +761,18 @@ static NTSTATUS lnxev_device_start(struct unix_device *iface)
 static void lnxev_device_stop(struct unix_device *iface)
 {
     struct lnxev_device *impl = lnxev_impl_from_unix_device(iface);
+    BOOL started;
 
     pthread_mutex_lock(&udev_cs);
+    started = impl->base.started;
     stop_polling_device(iface);
     list_remove(&impl->base.unix_device.entry);
     impl->haptics.type = -1;
     pthread_mutex_unlock(&udev_cs);
-    pthread_cond_signal(&impl->haptics_cond);
 
+    /* the haptics thread only exists once the device was started */
+    if (!started) return;
+    pthread_cond_signal(&impl->haptics_cond);
     pthread_join(impl->haptics_thread, NULL);
     pthread_cond_destroy(&impl->haptics_cond);
 }
