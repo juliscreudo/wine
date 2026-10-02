@@ -1945,6 +1945,10 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
             /* check for trailing slash on file path */
             if ((errno == ENOENT || (errno == ENOTDIR && !(options & FILE_DIRECTORY_FILE))) && name[strlen(name) - 1] == '/')
                 set_error( STATUS_OBJECT_NAME_INVALID );
+            /* device opened exclusively by someone else (e.g. a serial port in use, see
+             * create_serial()); Windows reports that as access denied */
+            else if (errno == EBUSY && !stat( name, &st ) && S_ISCHR(st.st_mode))
+                set_error( STATUS_ACCESS_DENIED );
             else
                 file_set_error();
             goto error;
