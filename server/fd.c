@@ -1928,7 +1928,10 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
     }
     else rw_mode = O_RDONLY;
 
-    if ((fd->unix_fd = open( name, rw_mode | (flags & ~O_TRUNC), *mode )) == -1)
+    /* the server is a session leader without a controlling terminal: without O_NOCTTY
+     * the first tty it opens becomes its controlling terminal, and the kernel hangs up
+     * that tty for every process using it when the server exits */
+    if ((fd->unix_fd = open( name, rw_mode | O_NOCTTY | (flags & ~O_TRUNC), *mode )) == -1)
     {
         /* if we tried to open a directory for write access, retry read-only */
         if (errno == EISDIR)
