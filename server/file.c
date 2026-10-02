@@ -255,7 +255,7 @@ static struct object *create_file( struct fd *root, const char *nameptr, data_si
     if (S_ISDIR(mode))
         obj = create_dir_obj( fd, access, mode );
     else if (S_ISCHR(mode) && is_serial_fd( fd ))
-        obj = create_serial( fd );
+        obj = create_serial( fd, access, sharing );
     else
         obj = create_file_obj( fd, access, mode );
 

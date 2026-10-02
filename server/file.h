@@ -238,7 +238,7 @@ extern void cleanup_thread_completion( struct thread *thread );
 /* serial port functions */
 
 extern int is_serial_fd( struct fd *fd );
-extern struct object *create_serial( struct fd *fd );
+extern struct object *create_serial( struct fd *fd, unsigned int access, unsigned int sharing );
 
 /* async I/O functions */
 
