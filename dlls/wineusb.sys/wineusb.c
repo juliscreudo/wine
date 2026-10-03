@@ -725,11 +725,6 @@ static NTSTATUS hub_query_id(struct usb_hub *hub, IRP *irp, BUS_QUERY_ID_TYPE ty
     return STATUS_SUCCESS;
 }
 
-/* libusb before 1.0.22 skips hubs that have no address, and only treats a
- * device as a hub if its service or one of its filter drivers has a known hub
- * driver name. Otherwise every device ends up reported as a root hub with a
- * made-up descriptor. Native root hubs are driven by usbhub3; Wine does not
- * load filter drivers, so the value is only there to be read back. */
 static void hub_set_compat_filters(struct usb_hub *hub)
 {
     static const WCHAR filters[] = L"USBHUB3\0";
