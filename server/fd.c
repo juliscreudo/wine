@@ -1928,9 +1928,6 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
     }
     else rw_mode = O_RDONLY;
 
-    /* the server is a session leader without a controlling terminal: without O_NOCTTY
-     * the first tty it opens becomes its controlling terminal, and the kernel hangs up
-     * that tty for every process using it when the server exits */
     if ((fd->unix_fd = open( name, rw_mode | O_NOCTTY | (flags & ~O_TRUNC), *mode )) == -1)
     {
         /* if we tried to open a directory for write access, retry read-only */
@@ -1945,8 +1942,7 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
             /* check for trailing slash on file path */
             if ((errno == ENOENT || (errno == ENOTDIR && !(options & FILE_DIRECTORY_FILE))) && name[strlen(name) - 1] == '/')
                 set_error( STATUS_OBJECT_NAME_INVALID );
-            /* device opened exclusively by someone else (e.g. a serial port in use, see
-             * create_serial()); Windows reports that as access denied */
+            /* device opened exclusively by someone else */
             else if (errno == EBUSY && !stat( name, &st ) && S_ISCHR(st.st_mode))
                 set_error( STATUS_ACCESS_DENIED );
             else

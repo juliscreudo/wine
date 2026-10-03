@@ -125,10 +125,6 @@ struct object *create_serial( struct fd *fd, unsigned int access, unsigned int s
     set_fd_user( fd, &serial_fd_ops, &serial->obj );
 
 #ifdef TIOCEXCL
-    /* Honor a share mode that allows neither reading nor writing (which is what
-     * Windows requires for serial ports) on the tty itself, so that other processes,
-     * including other Wine prefixes, can't open the port and take it over while it is
-     * in use. The kernel clears the flag when the last descriptor of the tty is closed. */
     if ((access & (FILE_READ_DATA | FILE_WRITE_DATA | FILE_APPEND_DATA)) &&
         !(sharing & (FILE_SHARE_READ | FILE_SHARE_WRITE)))
         ioctl( get_unix_fd( fd ), TIOCEXCL );
