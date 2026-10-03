@@ -852,7 +852,6 @@ static NTSTATUS hub_pnp(DEVICE_OBJECT *device_obj, IRP *irp)
 
             caps->RawDeviceOK = 1;
             caps->UniqueID = 1;
-            /* See hub_set_compat_filters(). */
             caps->Address = 0;
 
             ret = STATUS_SUCCESS;
