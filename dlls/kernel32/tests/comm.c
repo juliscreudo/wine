@@ -1395,6 +1395,284 @@ static void test_WaitRx(void)
     CloseHandle(hcom);
 }
 
+/*
+ * EV_RXCHAR is an event, not a state: every received character is recorded
+ * in the event history, a WaitCommEvent returns and clears that history, and
+ * characters already sitting in the input queue don't satisfy the next wait.
+ * Need Loopback TX->RX
+ */
+
+static HANDLE rx_open(DWORD mask)
+{
+    COMMTIMEOUTS timeouts = { MAXDWORD, 0, 0, 0, 0 };
+    HANDLE hcom;
+    DCB dcb;
+
+    hcom = test_OpenComm(TRUE);
+    if (hcom == INVALID_HANDLE_VALUE) return hcom;
+
+    memset(&dcb, 0, sizeof(dcb));
+    dcb.DCBlength = sizeof(dcb);
+    ok(GetCommState(hcom, &dcb), "GetCommState failed, error %lu\n", GetLastError());
+    dcb.BaudRate = FASTBAUD;
+    dcb.ByteSize = 8;
+    dcb.Parity = NOPARITY;
+    dcb.StopBits = ONESTOPBIT;
+    dcb.fBinary = TRUE;
+    dcb.fParity = FALSE;
+    dcb.fOutxCtsFlow = FALSE;
+    dcb.fOutxDsrFlow = FALSE;
+    dcb.fDtrControl = DTR_CONTROL_ENABLE;
+    dcb.fRtsControl = RTS_CONTROL_ENABLE;
+    dcb.fOutX = FALSE;
+    dcb.fInX = FALSE;
+    dcb.fErrorChar = FALSE;
+    dcb.fNull = FALSE;
+    dcb.fAbortOnError = FALSE;
+    ok(SetCommState(hcom, &dcb), "SetCommState failed, error %lu\n", GetLastError());
+    ok(SetCommTimeouts(hcom, &timeouts), "SetCommTimeouts failed, error %lu\n", GetLastError());
+    ok(PurgeComm(hcom, PURGE_RXCLEAR | PURGE_TXCLEAR), "PurgeComm failed, error %lu\n", GetLastError());
+    ok(SetCommMask(hcom, mask), "SetCommMask failed, error %lu\n", GetLastError());
+    return hcom;
+}
+
+static void rx_write(HANDLE hcom, DWORD len)
+{
+    static const char data[] = "abcdefghijklmnop";
+    OVERLAPPED ovl;
+    DWORD written = 0;
+    BOOL ret;
+
+    memset(&ovl, 0, sizeof(ovl));
+    ovl.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    ret = WriteFile(hcom, data, len, &written, &ovl);
+    if (!ret && GetLastError() == ERROR_IO_PENDING &&
+        WaitForSingleObject(ovl.hEvent, TIMEOUT) == WAIT_OBJECT_0)
+        ret = GetOverlappedResult(hcom, &ovl, &written, FALSE);
+    ok(ret && written == len, "WriteFile ret %d, written %lu, error %lu\n", ret, written, GetLastError());
+    CloseHandle(ovl.hEvent);
+}
+
+/* wait until the loopback delivered the expected number of characters */
+static DWORD rx_queue(HANDLE hcom, DWORD expected)
+{
+    DWORD start = GetTickCount(), errors;
+    COMSTAT stat;
+
+    for (;;)
+    {
+        stat.cbInQue = 0;
+        if (!ClearCommError(hcom, &errors, &stat)) break;
+        if (stat.cbInQue >= expected || GetTickCount() - start > TIMEOUT) break;
+        Sleep(10);
+    }
+    return stat.cbInQue;
+}
+
+static DWORD rx_read(HANDLE hcom)
+{
+    OVERLAPPED ovl;
+    char buf[64];
+    DWORD read = 0;
+    BOOL ret;
+
+    memset(&ovl, 0, sizeof(ovl));
+    ovl.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    ret = ReadFile(hcom, buf, sizeof(buf), &read, &ovl);
+    if (!ret && GetLastError() == ERROR_IO_PENDING &&
+        WaitForSingleObject(ovl.hEvent, TIMEOUT) == WAIT_OBJECT_0)
+        ret = GetOverlappedResult(hcom, &ovl, &read, FALSE);
+    ok(ret, "ReadFile failed, error %lu\n", GetLastError());
+    CloseHandle(ovl.hEvent);
+    return read;
+}
+
+static void rx_wait_start(HANDLE hcom, OVERLAPPED *ovl, DWORD *evtmask)
+{
+    BOOL ret;
+
+    *evtmask = 0;
+    ResetEvent(ovl->hEvent);
+    ret = WaitCommEvent(hcom, evtmask, ovl);
+    ok(ret || GetLastError() == ERROR_IO_PENDING, "WaitCommEvent failed, error %lu\n", GetLastError());
+}
+
+/* returns FALSE if the wait is still pending after the timeout */
+static BOOL rx_wait_done(HANDLE hcom, OVERLAPPED *ovl, DWORD timeout)
+{
+    DWORD bytes;
+
+    if (!HasOverlappedIoCompleted(ovl)) WaitForSingleObject(ovl->hEvent, timeout);
+    if (!HasOverlappedIoCompleted(ovl)) return FALSE;
+    ok(GetOverlappedResult(hcom, ovl, &bytes, FALSE), "WaitCommEvent failed, error %lu\n", GetLastError());
+    return TRUE;
+}
+
+/* complete a wait still pending with a new character, then drop everything */
+static void rx_close(HANDLE hcom, OVERLAPPED *ovl)
+{
+    if (!HasOverlappedIoCompleted(ovl))
+    {
+        rx_write(hcom, 1);
+        if (!rx_wait_done(hcom, ovl, TIMEOUT))
+        {
+            ok(0, "WaitCommEvent not completed by a new character\n");
+            CancelIo(hcom);
+            WaitForSingleObject(ovl->hEvent, TIMEOUT);
+        }
+    }
+    PurgeComm(hcom, PURGE_RXCLEAR | PURGE_TXCLEAR);
+    CloseHandle(hcom);
+}
+
+static void test_WaitRxHistory(void)
+{
+    OVERLAPPED ovl;
+    HANDLE hcom;
+    DWORD evtmask, queued;
+    BOOL done;
+
+    if (!loopback_txd_rxd) return;
+
+    memset(&ovl, 0, sizeof(ovl));
+    ovl.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+
+    /* a pending wait completes on arrival; the queued character doesn't satisfy the next one */
+    winetest_push_context("pending");
+    if ((hcom = rx_open(EV_RXCHAR)) != INVALID_HANDLE_VALUE)
+    {
+        rx_wait_start(hcom, &ovl, &evtmask);
+        ok(!rx_wait_done(hcom, &ovl, 200), "wait with an empty queue completed, evtmask 0x%08lx\n", evtmask);
+        rx_write(hcom, 1);
+        done = rx_wait_done(hcom, &ovl, TIMEOUT);
+        ok(done && (evtmask & EV_RXCHAR), "arrival didn't complete the wait: done %d, evtmask 0x%08lx\n", done, evtmask);
+        queued = rx_queue(hcom, 1);
+        ok(queued == 1, "got %lu characters, expected 1\n", queued);
+
+        rx_wait_start(hcom, &ovl, &evtmask);
+        done = rx_wait_done(hcom, &ovl, 200);
+        ok(!done, "wait completed for a character already reported, evtmask 0x%08lx\n", evtmask);
+        if (!done)
+        {
+            rx_write(hcom, 1);
+            done = rx_wait_done(hcom, &ovl, TIMEOUT);
+            ok(done && (evtmask & EV_RXCHAR), "new character didn't complete the wait: done %d, evtmask 0x%08lx\n",
+               done, evtmask);
+            queued = rx_queue(hcom, 2);
+            ok(queued == 2, "got %lu characters, expected 2\n", queued);
+        }
+        rx_close(hcom, &ovl);
+    }
+    winetest_pop_context();
+
+    /* characters received without a pending wait are one event for the next wait */
+    winetest_push_context("history");
+    if ((hcom = rx_open(EV_RXCHAR)) != INVALID_HANDLE_VALUE)
+    {
+        rx_write(hcom, 8);
+        queued = rx_queue(hcom, 8);
+        ok(queued == 8, "got %lu characters, expected 8\n", queued);
+        rx_wait_start(hcom, &ovl, &evtmask);
+        done = rx_wait_done(hcom, &ovl, 100);
+        ok(done && (evtmask & EV_RXCHAR), "history not reported: done %d, evtmask 0x%08lx\n", done, evtmask);
+
+        rx_wait_start(hcom, &ovl, &evtmask);
+        done = rx_wait_done(hcom, &ovl, 200);
+        ok(!done, "history reported twice, evtmask 0x%08lx\n", evtmask);
+        if (!done)
+        {
+            rx_write(hcom, 1);
+            done = rx_wait_done(hcom, &ovl, TIMEOUT);
+            ok(done && (evtmask & EV_RXCHAR), "new character didn't complete the wait: done %d, evtmask 0x%08lx\n",
+               done, evtmask);
+            queued = rx_queue(hcom, 9);
+            ok(queued == 9, "got %lu characters, expected 9\n", queued);
+            ok(rx_read(hcom) == 9, "lost characters\n");
+        }
+        rx_close(hcom, &ovl);
+    }
+    winetest_pop_context();
+
+    /* reading the characters doesn't clear the history */
+    winetest_push_context("read");
+    if ((hcom = rx_open(EV_RXCHAR)) != INVALID_HANDLE_VALUE)
+    {
+        rx_write(hcom, 4);
+        queued = rx_queue(hcom, 4);
+        ok(queued == 4, "got %lu characters, expected 4\n", queued);
+        ok(rx_read(hcom) == 4, "lost characters\n");
+        rx_wait_start(hcom, &ovl, &evtmask);
+        done = rx_wait_done(hcom, &ovl, 100);
+        ok(done && (evtmask & EV_RXCHAR), "history lost after ReadFile: done %d, evtmask 0x%08lx\n", done, evtmask);
+        rx_close(hcom, &ovl);
+    }
+    winetest_pop_context();
+
+    /* SetCommMask clears the history, even for the events still in the mask (usbser.sys) */
+    winetest_push_context("mask reset");
+    if ((hcom = rx_open(EV_RXCHAR)) != INVALID_HANDLE_VALUE)
+    {
+        rx_write(hcom, 1);
+        queued = rx_queue(hcom, 1);
+        ok(queued == 1, "got %lu characters, expected 1\n", queued);
+        ok(SetCommMask(hcom, EV_RXCHAR | EV_CTS), "SetCommMask failed, error %lu\n", GetLastError());
+        rx_wait_start(hcom, &ovl, &evtmask);
+        done = rx_wait_done(hcom, &ovl, 200);
+        ok(!done, "history kept across SetCommMask, evtmask 0x%08lx\n", evtmask);
+        rx_close(hcom, &ovl);
+    }
+    winetest_pop_context();
+
+    winetest_push_context("mask dropped");
+    if ((hcom = rx_open(EV_RXCHAR)) != INVALID_HANDLE_VALUE)
+    {
+        rx_write(hcom, 1);
+        queued = rx_queue(hcom, 1);
+        ok(queued == 1, "got %lu characters, expected 1\n", queued);
+        ok(SetCommMask(hcom, EV_CTS), "SetCommMask failed, error %lu\n", GetLastError());
+        ok(SetCommMask(hcom, EV_RXCHAR), "SetCommMask failed, error %lu\n", GetLastError());
+        rx_wait_start(hcom, &ovl, &evtmask);
+        done = rx_wait_done(hcom, &ovl, 200);
+        ok(!done, "history kept by a mask without EV_RXCHAR, evtmask 0x%08lx\n", evtmask);
+        rx_close(hcom, &ovl);
+    }
+    winetest_pop_context();
+
+    winetest_push_context("mask off");
+    if ((hcom = rx_open(EV_CTS)) != INVALID_HANDLE_VALUE)
+    {
+        rx_write(hcom, 1);
+        queued = rx_queue(hcom, 1);
+        ok(queued == 1, "got %lu characters, expected 1\n", queued);
+        ok(SetCommMask(hcom, EV_RXCHAR), "SetCommMask failed, error %lu\n", GetLastError());
+        rx_wait_start(hcom, &ovl, &evtmask);
+        done = rx_wait_done(hcom, &ovl, 200);
+        ok(!done, "character received without EV_RXCHAR in the mask reported, evtmask 0x%08lx\n", evtmask);
+        rx_close(hcom, &ovl);
+    }
+    winetest_pop_context();
+
+    /* PURGE_RXCLEAR drops the characters, not the history */
+    winetest_push_context("purge");
+    if ((hcom = rx_open(EV_RXCHAR)) != INVALID_HANDLE_VALUE)
+    {
+        rx_write(hcom, 1);
+        queued = rx_queue(hcom, 1);
+        ok(queued == 1, "got %lu characters, expected 1\n", queued);
+        ok(PurgeComm(hcom, PURGE_RXCLEAR), "PurgeComm failed, error %lu\n", GetLastError());
+        queued = rx_queue(hcom, 0);
+        ok(queued == 0, "got %lu characters after PURGE_RXCLEAR\n", queued);
+        rx_wait_start(hcom, &ovl, &evtmask);
+        done = rx_wait_done(hcom, &ovl, 100);
+        ok(done && (evtmask & EV_RXCHAR), "history lost after PURGE_RXCLEAR: done %d, evtmask 0x%08lx\n",
+           done, evtmask);
+        rx_close(hcom, &ovl);
+    }
+    winetest_pop_context();
+
+    CloseHandle(ovl.hEvent);
+}
+
 /* Change the controlling line after the given timeout to the given state
    By the loopback, this should trigger the WaitCommEvent
 */
@@ -2222,6 +2500,7 @@ START_TEST(comm)
     test_LoopbackDtrRing();
     test_LoopbackDtrDcd();
     test_WaitRx();
+    test_WaitRxHistory();
     test_WaitCts();
     test_AbortWaitCts();
     test_WaitDsr();
