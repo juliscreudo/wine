@@ -452,17 +452,19 @@ static NTSTATUS get_status(int fd, SERIAL_STATUS* ss)
     return status;
 }
 
-static NTSTATUS get_wait_mask( HANDLE hDevice, UINT *mask, BOOL *pending_write )
+static NTSTATUS get_wait_mask( HANDLE hDevice, UINT *mask, UINT *history, BOOL *pending_write )
 {
     unsigned int status;
 
     SERVER_START_REQ( get_serial_info )
     {
         req->handle = wine_server_obj_handle( hDevice );
-        req->flags = pending_write ? SERIALINFO_PENDING_WRITE : 0;
+        req->flags = SERIALINFO_HISTORY;
+        if (pending_write) req->flags |= SERIALINFO_PENDING_WRITE;
         if (!(status = wine_server_call( req )))
         {
             *mask = reply->eventmask;
+            *history = reply->history;
             if (pending_write) *pending_write = reply->pending_write;
         }
     }
@@ -1024,12 +1026,12 @@ static NTSTATUS get_irq_info(int fd, serial_irq_info *irq_info)
 }
 
 
-static DWORD check_events(int fd, UINT mask,
+static DWORD check_events(UINT mask,
                           const serial_irq_info *new,
                           const serial_irq_info *old,
                           UINT new_mstat, UINT old_mstat, BOOL pending_write)
 {
-    DWORD ret = 0, queue;
+    DWORD ret = 0;
 
     TRACE("mask 0x%08x\n", mask);
     TRACE("old->rx          0x%08x vs. new->rx          0x%08x\n", old->rx, new->rx);
@@ -1047,16 +1049,6 @@ static DWORD check_events(int fd, UINT mask,
     if ((old_mstat & MS_RING_ON) != (new_mstat & MS_RING_ON)) ret |= EV_RING;
     if ((old_mstat & MS_RLSD_ON) != (new_mstat & MS_RLSD_ON)) ret |= EV_RLSD;
     if (old->frame != new->frame || old->overrun != new->overrun || old->parity != new->parity) ret |= EV_ERR;
-    if (mask & EV_RXCHAR)
-    {
-	queue = 0;
-#ifdef TIOCINQ
-	if (ioctl(fd, TIOCINQ, &queue))
-	    WARN("TIOCINQ returned error\n");
-#endif
-	if (queue)
-	    ret |= EV_RXCHAR;
-    }
     if (mask & EV_TXEMPTY)
     {
         if ((!old->temt || pending_write) && new->temt)
@@ -1079,7 +1071,7 @@ static BOOL async_wait_proc( void *user, ULONG_PTR *info, unsigned int *status )
     if (!server_get_unix_fd( commio->handle, FILE_READ_DATA | FILE_WRITE_DATA, &fd, &needs_close, NULL, NULL ))
     {
         serial_irq_info new_irq_info;
-        UINT new_mstat, dummy;
+        UINT new_mstat, dummy, history;
 
         TRACE( "device=%p fd=0x%08x mask=0x%08x buffer=%p irq_info=%p\n",
                commio->handle, fd, commio->evtmask, commio->events, &commio->irq_info );
@@ -1098,9 +1090,15 @@ static BOOL async_wait_proc( void *user, ULONG_PTR *info, unsigned int *status )
         }
         else
         {
-            DWORD events = check_events( fd, commio->evtmask,
+            DWORD events = check_events( commio->evtmask,
                                          &new_irq_info, &commio->irq_info,
                                          new_mstat, commio->mstat, commio->pending_write );
+            if (!events)
+            {
+                get_wait_mask( commio->handle, &dummy, &history,
+                               (commio->evtmask & EV_TXEMPTY) ? &commio->pending_write : NULL );
+                events = history & commio->evtmask;
+            }
             TRACE("events %#x\n", events);
             if (events)
             {
@@ -1110,7 +1108,6 @@ static BOOL async_wait_proc( void *user, ULONG_PTR *info, unsigned int *status )
             }
             else
             {
-                get_wait_mask( commio->handle, &dummy, (commio->evtmask & EV_TXEMPTY) ? &commio->pending_write : NULL );
                 if (needs_close) close( fd );
                 return FALSE;
             }
@@ -1129,6 +1126,7 @@ static NTSTATUS wait_on( HANDLE handle, int fd, HANDLE event, PIO_APC_ROUTINE ap
     NTSTATUS            status;
     HANDLE wait_handle;
     ULONG options;
+    UINT history;
 
     if (!(commio = (async_commio *)alloc_fileio( sizeof(*commio), async_wait_proc )))
         return STATUS_NO_MEMORY;
@@ -1136,7 +1134,8 @@ static NTSTATUS wait_on( HANDLE handle, int fd, HANDLE event, PIO_APC_ROUTINE ap
     commio->handle = handle;
     commio->events = out_buffer;
     commio->pending_write = 0;
-    status = get_wait_mask( handle, &commio->evtmask, (commio->evtmask & EV_TXEMPTY) ? &commio->pending_write : NULL );
+    status = get_wait_mask( handle, &commio->evtmask, &history,
+                            (commio->evtmask & EV_TXEMPTY) ? &commio->pending_write : NULL );
     if (status)
     {
         free( commio );
@@ -1198,9 +1197,10 @@ static NTSTATUS wait_on( HANDLE handle, int fd, HANDLE event, PIO_APC_ROUTINE ap
     if (status == STATUS_ALERTED)
     {
         /* We might have received something or the TX buffer is delivered */
-        DWORD events = check_events(fd, commio->evtmask,
+        DWORD events = check_events(commio->evtmask,
                                     &commio->irq_info, &commio->irq_info,
                                     commio->mstat, commio->mstat, commio->pending_write);
+        events |= history & commio->evtmask;
         if (events)
         {
             status = STATUS_SUCCESS;

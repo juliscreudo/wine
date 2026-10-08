@@ -35,6 +35,10 @@
 #include <termios.h>
 #include <unistd.h>
 #include <poll.h>
+#if defined(HAVE_SYS_EPOLL_H) && defined(HAVE_EPOLL_CREATE)
+# include <sys/epoll.h>
+# define USE_EPOLL
+#endif
 #ifdef HAVE_UTIME_H
 #include <utime.h>
 #endif
@@ -65,6 +69,8 @@ static void serial_ioctl( struct fd *fd, ioctl_code_t code, struct async *async 
 static void serial_queue_async( struct fd *fd, struct async *async, int type, int count );
 static void serial_reselect_async( struct fd *fd, struct async_queue *queue );
 
+static void serial_rx_poll_event( struct fd *fd, int event );
+
 struct serial
 {
     struct object       obj;
@@ -75,7 +81,9 @@ struct serial
     struct timeout_user *read_timer;
     SERIAL_TIMEOUTS     timeouts;
     unsigned int        eventmask;
+    unsigned int        history;  /* events received since the last get_serial_info */
     unsigned int        pending_write : 1;
+    struct fd          *rx_fd;    /* epoll instance signaling the arrival of characters */
 
     struct termios      original;
 
@@ -101,12 +109,80 @@ static const struct fd_ops serial_fd_ops =
     .reselect_async = serial_reselect_async,
 };
 
+static const struct fd_ops serial_rx_fd_ops =
+{
+    .poll_event     = serial_rx_poll_event,
+};
+
 /* check if the given fd is a serial port */
 int is_serial_fd( struct fd *fd )
 {
     struct termios tios;
 
     return !tcgetattr( get_unix_fd(fd), &tios );
+}
+
+#ifdef USE_EPOLL
+/* EV_RXCHAR reports the arrival of characters, not a non-empty input queue: the tty is watched
+ * with EPOLLET, which signals each batch of received characters once */
+static void serial_rx_init( struct serial *serial )
+{
+    struct epoll_event event = { .events = EPOLLIN | EPOLLET };
+    int unix_fd;
+
+    if ((unix_fd = epoll_create( 1 )) == -1) return;
+    if (epoll_ctl( unix_fd, EPOLL_CTL_ADD, get_unix_fd( serial->fd ), &event ) == -1)
+    {
+        close( unix_fd );
+        return;
+    }
+    serial->rx_fd = create_anonymous_fd( &serial_rx_fd_ops, unix_fd, &serial->obj, 0 );
+}
+
+/* record the characters received since the last call, returns TRUE if they are an event */
+static int serial_rx_update( struct serial *serial )
+{
+    struct epoll_event event;
+
+    if (epoll_wait( get_unix_fd( serial->rx_fd ), &event, 1, 0 ) != 1) return 0;
+    if (!(serial->eventmask & SERIAL_EV_RXCHAR)) return 0;
+    serial->history |= SERIAL_EV_RXCHAR;
+    return 1;
+}
+#else
+static void serial_rx_init( struct serial *serial ) { }
+static int serial_rx_update( struct serial *serial ) { return 0; }
+#endif
+
+static void serial_rx_poll_event( struct fd *fd, int event )
+{
+    struct serial *serial = get_fd_user( fd );
+
+    if (serial_rx_update( serial )) async_wake_up( &serial->wait_q, STATUS_ALERTED );
+}
+
+/* return and clear the events received since the last call */
+static unsigned int serial_get_history( struct serial *serial )
+{
+    unsigned int history;
+
+    if (serial->rx_fd)
+    {
+        serial_rx_update( serial );
+        history = serial->history;
+        serial->history = 0;
+        return history;
+    }
+
+    /* no notification of arrival, report a non-empty input queue */
+#ifdef TIOCINQ
+    if (serial->eventmask & SERIAL_EV_RXCHAR)
+    {
+        int queue = 0;
+        if (!ioctl( get_unix_fd( serial->fd ), TIOCINQ, &queue ) && queue) return SERIAL_EV_RXCHAR;
+    }
+#endif
+    return 0;
 }
 
 /* create a serial object for a given fd */
@@ -118,11 +194,14 @@ struct object *create_serial( struct fd *fd, unsigned int access, unsigned int s
 
     serial->read_timer   = NULL;
     serial->eventmask    = 0;
+    serial->history      = 0;
     serial->pending_write = 0;
+    serial->rx_fd        = NULL;
     memset( &serial->timeouts, 0, sizeof(serial->timeouts) );
     init_async_queue( &serial->wait_q );
     serial->fd = (struct fd *)grab_object( fd );
     set_fd_user( fd, &serial_fd_ops, &serial->obj );
+    serial_rx_init( serial );
 
 #ifdef TIOCEXCL
     if ((access & (FILE_READ_DATA | FILE_WRITE_DATA | FILE_APPEND_DATA)) &&
@@ -143,6 +222,7 @@ static void serial_destroy( struct object *obj)
     struct serial *serial = (struct serial *)obj;
     if (serial->read_timer) remove_timeout_user( serial->read_timer );
     free_async_queue( &serial->wait_q );
+    if (serial->rx_fd) release_object( serial->rx_fd );
     release_object( serial->fd );
 }
 
@@ -222,6 +302,13 @@ static void serial_ioctl( struct fd *fd, ioctl_code_t code, struct async *async 
             return;
         }
         serial->eventmask = *(unsigned int *)get_req_data();
+        if (serial->rx_fd)
+        {
+            /* setting the mask clears the event history, even for the events kept */
+            serial_rx_update( serial );
+            set_fd_events( serial->rx_fd, (serial->eventmask & SERIAL_EV_RXCHAR) ? POLLIN : 0 );
+        }
+        serial->history = 0;
         async_wake_up( &serial->wait_q, STATUS_CANCELLED );
         return;
 
@@ -316,6 +403,10 @@ DECL_HANDLER(get_serial_info)
     {
         /* event mask */
         reply->eventmask    = serial->eventmask;
+
+        /* event history */
+        if (req->flags & SERIALINFO_HISTORY)
+            reply->history = serial_get_history( serial );
 
         /* pending write */
         reply->pending_write = serial->pending_write;

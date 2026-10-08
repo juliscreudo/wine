@@ -1556,6 +1556,7 @@ static void dump_get_serial_info_reply( const struct get_serial_info_reply *req 
 {
     fprintf( stderr, " eventmask=%08x", req->eventmask );
     fprintf( stderr, ", pending_write=%08x", req->pending_write );
+    fprintf( stderr, ", history=%08x", req->history );
 }
 
 static void dump_set_serial_info_request( const struct set_serial_info_request *req )

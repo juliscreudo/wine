@@ -3307,6 +3307,8 @@ struct get_serial_info_reply
     struct reply_header __header;
     unsigned int eventmask;
     unsigned int pending_write;
+    unsigned int history;
+    char __pad_20[4];
 };
 
 
@@ -3323,6 +3325,7 @@ struct set_serial_info_reply
     struct reply_header __header;
 };
 #define SERIALINFO_PENDING_WRITE 0x04
+#define SERIALINFO_HISTORY       0x08
 
 
 struct cancel_sync_request
@@ -7184,6 +7187,6 @@ union generic_reply
     struct alpc_create_port_reply alpc_create_port_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 962
+#define SERVER_PROTOCOL_VERSION 963
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
