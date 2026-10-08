@@ -1174,7 +1174,10 @@ static NTSTATUS wait_on( HANDLE handle, int fd, HANDLE event, PIO_APC_ROUTINE ap
 	goto error_caps;
 #endif
     if (commio->evtmask & EV_RXFLAG)
-	FIXME("EV_RXFLAG not handled\n");
+    {
+        static int once;
+        if (!once++) FIXME("EV_RXFLAG not handled\n");
+    }
 
     if ((status = get_irq_info(fd, &commio->irq_info)) &&
         (commio->evtmask & (EV_BREAK | EV_ERR)))
