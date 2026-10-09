@@ -1692,9 +1692,7 @@ static void test_AbortWaitLoop(void)
             if (waited && !args.ret) failed++;
         }
         ok(count > 0, "%s: no pending wait\n", mode_name[mode]);
-        flaky_wine
         ok(!lost, "%s: %u of %u pending waits did not complete\n", mode_name[mode], lost, count);
-        flaky_wine
         ok(!failed, "%s failed %u of %u times\n", mode_name[mode], failed, count);
         if (mode == 2)
             ok(!status, "CancelIoEx: %u of %u waits not completed with ERROR_OPERATION_ABORTED\n", status, count);

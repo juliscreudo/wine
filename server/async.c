@@ -107,6 +107,7 @@ struct async
     struct iosb         *iosb;            /* I/O status block */
     obj_handle_t         wait_handle;     /* pre-allocated wait handle */
     unsigned int         initial_status;  /* status returned from initial request */
+    unsigned int         deferred_status; /* status to apply if the client restarts an alerted async */
     unsigned int         signaled :1;
     unsigned int         pending :1;      /* request successfully queued, but pending */
     unsigned int         direct_result :1;/* a flag if we're passing result directly from request instead of APC  */
@@ -115,6 +116,7 @@ struct async
     unsigned int         canceled :1;     /* have we already queued cancellation for this async? */
     unsigned int         unknown_status :1; /* initial status is not known yet */
     unsigned int         blocking :1;     /* async is blocking */
+    unsigned int         overlapped :1;   /* fd is overlapped (async->fd may be gone when it is terminated) */
     unsigned int         is_system :1;    /* background system operation not affecting userspace visible state. */
     struct completion   *completion;      /* completion associated with fd */
     apc_param_t          comp_key;        /* completion key associated with fd */
@@ -214,7 +216,13 @@ void async_terminate( struct async *async, unsigned int status )
 {
     struct iosb *iosb = async->iosb;
 
-    if (async->terminated) return;
+    if (async->terminated)
+    {
+        /* the client may still restart an alerted async, so keep the new status for then */
+        if (async->alerted && status != STATUS_ALERTED && async->deferred_status == STATUS_PENDING)
+            async->deferred_status = status;
+        return;
+    }
 
     async->terminated = 1;
     if (async->iosb && async->iosb->status == STATUS_PENDING) async->iosb->status = status;
@@ -239,7 +247,7 @@ void async_terminate( struct async *async, unsigned int status )
          * files). the client should not fill the IOSB in this case; pass it as
          * NULL to communicate that.
          * note that we check the IOSB status and not the initial status */
-        if (NT_ERROR( status ) && (!is_fd_overlapped( async->fd ) || !async->pending))
+        if (NT_ERROR( status ) && (!async->overlapped || !async->pending))
             data.async_io.sb = 0;
         else
             data.async_io.sb = async->data.iosb;
@@ -317,6 +325,7 @@ struct async *create_async( struct fd *fd, struct thread *thread, const struct a
     async->queue         = NULL;
     async->fd            = (struct fd *)grab_object( fd );
     async->initial_status = STATUS_PENDING;
+    async->deferred_status = STATUS_PENDING;
     async->signaled      = 0;
     async->pending       = 1;
     async->wait_handle   = 0;
@@ -325,7 +334,8 @@ struct async *create_async( struct fd *fd, struct thread *thread, const struct a
     async->terminated    = 0;
     async->canceled      = 0;
     async->unknown_status = 0;
-    async->blocking      = !is_fd_overlapped( fd );
+    async->overlapped    = is_fd_overlapped( fd );
+    async->blocking      = !async->overlapped;
     async->is_system     = 0;
     async->completion    = fd_get_completion( fd, &async->comp_key );
     async->comp_flags    = 0;
@@ -562,13 +572,22 @@ void async_set_result( struct object *obj, unsigned int status, apc_param_t tota
     {
         async->terminated = 0;
         async->alerted = 0;
-        async_reselect( async );
+        if (async->deferred_status != STATUS_PENDING)
+        {
+            /* it was terminated while the client was processing STATUS_ALERTED */
+            status = async->deferred_status;
+            async->deferred_status = STATUS_PENDING;
+            async_terminate( async, status );
+        }
+        else async_reselect( async );
     }
     else
     {
         if (async->timeout) remove_timeout_user( async->timeout );
         async->timeout = NULL;
         async->terminated = 1;
+        async->alerted = 0;
+        async->deferred_status = STATUS_PENDING;
         if (async->iosb) async->iosb->status = status;
 
         /* don't signal completion if the async failed synchronously
@@ -639,6 +658,12 @@ int async_waiting( struct async_queue *queue )
     return !async->terminated;
 }
 
+/* an alerted async may still be restarted by the client, so it can still be canceled */
+static int async_is_finished( struct async *async )
+{
+    return async->terminated && (!async->alerted || async->deferred_status != STATUS_PENDING);
+}
+
 static void cancel_async( struct async *async )
 {
     async->canceled = 1;
@@ -673,7 +698,7 @@ static int cancel_process_async( struct process *process, struct object *obj, st
 restart:
     LIST_FOR_EACH_ENTRY( async, &process->asyncs, struct async, process_entry )
     {
-        if (async->terminated || async->is_system) continue;
+        if (async_is_finished( async ) || async->is_system) continue;
         if ((!obj || (get_fd_user( async->fd ) == obj)) &&
             (!thread || async->thread == thread) &&
             (!iosb || async->data.iosb == iosb))
@@ -713,7 +738,7 @@ static int cancel_blocking( struct process *process, struct thread *thread, clie
 restart:
     LIST_FOR_EACH_ENTRY( async, &process->asyncs, struct async, process_entry )
     {
-        if (async->terminated || async->canceled) continue;
+        if (async_is_finished( async ) || async->canceled) continue;
         if (async->blocking && async->thread == thread &&
             (!iosb || async->data.iosb == iosb))
         {
@@ -750,7 +775,7 @@ int async_close_obj_handle( struct object *obj, struct process *process, obj_han
 restart:
     LIST_FOR_EACH_ENTRY( async, &process->asyncs, struct async, process_entry )
     {
-        if (async->terminated || async->canceled || get_fd_user( async->fd ) != obj) continue;
+        if (async_is_finished( async ) || async->canceled || get_fd_user( async->fd ) != obj) continue;
         if (!async->completion || !async->data.apc_context || async->event) continue;
         cancel_async( async );
         goto restart;
