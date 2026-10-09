@@ -1591,6 +1591,121 @@ static void test_AbortWaitCts(void)
     CloseHandle( alarmThread );
 }
 
+struct abort_wait_args
+{
+    HANDLE hcom;
+    OVERLAPPED *ovl;
+    HANDLE pending;
+    unsigned int mode;
+    DWORD delay;
+    BOOL ret;
+};
+
+static DWORD CALLBACK abort_wait_thread(void *arg)
+{
+    struct abort_wait_args *args = arg;
+
+    WaitForSingleObject(args->pending, INFINITE);
+    Sleep(args->delay);
+    if (args->mode == 0) args->ret = SetCommMask(args->hcom, 0);
+    else if (args->mode == 1) args->ret = SetCommMask(args->hcom, EV_CTS);
+    else args->ret = CancelIoEx(args->hcom, args->ovl);
+    return 0;
+}
+
+/* Change the CommMask, or cancel the wait, from another thread after a
+   short delay (0-3 ms) while an overlapped WaitCommEvent is pending. The
+   wait must always complete, and CancelIoEx must always find it.
+   No special port connections needed
+*/
+static void test_AbortWaitLoop(void)
+{
+    static const char * const mode_name[] = { "SetCommMask(0)", "SetCommMask(EV_CTS)", "CancelIoEx" };
+    /* static: a wait that is never completed must not point into a dead stack frame */
+    static OVERLAPPED ovl;
+    struct abort_wait_args args;
+    unsigned int mode, i, k, count, lost, failed, status;
+    DWORD evtmask, bytes;
+    HANDLE hcom, thread;
+    BOOL ret, waited;
+
+    hcom = test_OpenComm(TRUE);
+    if (hcom == INVALID_HANDLE_VALUE) return;
+
+    args.hcom = hcom;
+    args.ovl = &ovl;
+    args.pending = CreateEventW(NULL, FALSE, FALSE, NULL);
+    ovl.hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+
+    for (mode = 0; mode < ARRAY_SIZE(mode_name); mode++)
+    {
+        count = lost = failed = status = 0;
+        for (i = 0; i < 200; i++)
+        {
+            ret = SetCommMask(hcom, EV_CTS);
+            ok(ret, "SetCommMask failed, error %lu\n", GetLastError());
+            args.mode = mode;
+            args.delay = i % 4;
+            args.ret = FALSE;
+            thread = CreateThread(NULL, 0, abort_wait_thread, &args, 0, NULL);
+            ok(thread != NULL, "CreateThread failed, error %lu\n", GetLastError());
+
+            evtmask = 0xdeadbeef;
+            SetLastError(0xdeadbeef);
+            ret = WaitCommEvent(hcom, &evtmask, &ovl);
+            waited = !ret && GetLastError() == ERROR_IO_PENDING;
+            if (waited)
+            {
+                count++;
+                SetEvent(args.pending);
+                if (WaitForSingleObject(ovl.hEvent, 500))
+                {
+                    lost++;
+                    /* the cleanup can hit the same race, so insist */
+                    for (k = 0; k < 5; k++)
+                    {
+                        SetCommMask(hcom, 0);
+                        CancelIoEx(hcom, &ovl);
+                        if (!WaitForSingleObject(ovl.hEvent, 500)) break;
+                    }
+                    if (k == 5)
+                    {
+                        ok(0, "%s: wait still pending after 5 cancellations\n", mode_name[mode]);
+                        WaitForSingleObject(thread, INFINITE);
+                        CloseHandle(thread);
+                        CloseHandle(hcom);
+                        return;
+                    }
+                }
+                SetLastError(0xdeadbeef);
+                ret = GetOverlappedResult(hcom, &ovl, &bytes, FALSE);
+                if (mode == 2 && (ret || GetLastError() != ERROR_OPERATION_ABORTED)) status++;
+            }
+            else
+            {
+                /* a real CTS event, nothing to abort */
+                trace("WaitCommEvent returned %d, error %lu, mask %#lx\n", ret, GetLastError(), evtmask);
+                SetEvent(args.pending);
+            }
+            WaitForSingleObject(thread, INFINITE);
+            CloseHandle(thread);
+            if (waited && !args.ret) failed++;
+        }
+        ok(count > 0, "%s: no pending wait\n", mode_name[mode]);
+        flaky_wine
+        ok(!lost, "%s: %u of %u pending waits did not complete\n", mode_name[mode], lost, count);
+        flaky_wine
+        ok(!failed, "%s failed %u of %u times\n", mode_name[mode], failed, count);
+        if (mode == 2)
+            ok(!status, "CancelIoEx: %u of %u waits not completed with ERROR_OPERATION_ABORTED\n", status, count);
+    }
+
+    SetCommMask(hcom, 0);
+    CloseHandle(ovl.hEvent);
+    CloseHandle(args.pending);
+    CloseHandle(hcom);
+}
+
 /*
  * Wait for a change in DSR
  * Needs Loopback from DTR to DSR
@@ -2224,6 +2339,7 @@ START_TEST(comm)
     test_WaitRx();
     test_WaitCts();
     test_AbortWaitCts();
+    test_AbortWaitLoop();
     test_WaitDsr();
     test_WaitRing();
     test_WaitDcd();
