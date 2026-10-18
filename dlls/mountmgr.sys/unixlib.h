@@ -21,6 +21,8 @@
 #include "mountmgr.h"
 #include "wine/unixlib.h"
 
+#define MAX_PORTS 256
+
 enum device_op
 {
     ADD_DOS_DEVICE,

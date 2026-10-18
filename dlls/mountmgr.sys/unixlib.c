@@ -119,13 +119,14 @@ static void detect_devices( const char **paths, char *names, ULONG size )
     while (*paths)
     {
         char unix_path[32];
-        unsigned int i = 0;
+        unsigned int i;
 
-        for (;;)
+        /* a new device gets the lowest free number, so there can be holes below the others */
+        for (i = 0; i < MAX_PORTS; i++)
         {
-            int len = snprintf( unix_path, sizeof(unix_path), *paths, i++ );
+            int len = snprintf( unix_path, sizeof(unix_path), *paths, i );
             if (len + 2 > size) break;
-            if (access( unix_path, F_OK ) != 0) break;
+            if (access( unix_path, F_OK ) != 0) continue;
             strcpy( names, unix_path );
             names += len + 1;
             size -= len + 1;

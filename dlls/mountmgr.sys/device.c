@@ -37,7 +37,6 @@
 WINE_DEFAULT_DEBUG_CHANNEL(mountmgr);
 
 #define MAX_DOS_DRIVES 26
-#define MAX_PORTS 256
 
 static const WCHAR drive_types[][8] =
 {
