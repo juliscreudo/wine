@@ -2123,6 +2123,206 @@ static BOOL create_port_device( DRIVER_OBJECT *driver, int n, const char *unix_p
     return TRUE;
 }
 
+struct port_number
+{
+    WCHAR        id[256];   /* device instance id */
+    unsigned int n;         /* COM number, 0 if none, ~0u for a device that is a user-defined port */
+    const char  *reason;
+};
+
+static BOOL port_bit( const BYTE *mask, unsigned int n )
+{
+    return mask[(n - 1) / 8] & (1 << ((n - 1) % 8));
+}
+
+/* the device instance id of each COM number, as in the Devices key of Windows */
+static void load_port_ids( HKEY key, WCHAR **ids )
+{
+    WCHAR name[16], value[256], *end;
+    DWORD i, name_len, size, type;
+    unsigned int n;
+    LSTATUS ret;
+
+    for (i = 0; ; i++)
+    {
+        name_len = ARRAY_SIZE(name);
+        size = sizeof(value) - sizeof(WCHAR);
+        ret = RegEnumValueW( key, i, name, &name_len, NULL, &type, (BYTE *)value, &size );
+        if (ret == ERROR_MORE_DATA) continue;
+        if (ret) break;
+        if (type != REG_SZ || wcsnicmp( name, L"COM", 3 )) continue;
+        n = wcstoul( name + 3, &end, 10 );
+        if (n < 1 || n > MAX_PORTS || *end) continue;
+        value[size / sizeof(WCHAR)] = 0;
+        ids[n - 1] = wcsdup( value );
+    }
+}
+
+/* ComDB has a bit for each COM number in use, like on Windows */
+static void save_port_ids( HKEY arbiter_key, HKEY devices_key, WCHAR **ids, const BOOL *changed,
+                           const BOOL *used )
+{
+    BYTE comdb[MAX_PORTS / 8] = { 0 }, old_comdb[MAX_PORTS / 8];
+    DWORD size = sizeof(old_comdb), type;
+    WCHAR name[16];
+    unsigned int n;
+
+    for (n = 1; n <= MAX_PORTS; n++)
+    {
+        if (ids[n - 1] || used[n - 1]) comdb[(n - 1) / 8] |= 1 << ((n - 1) % 8);
+        if (!changed[n - 1]) continue;
+        swprintf( name, ARRAY_SIZE(name), L"COM%u", n );
+        if (ids[n - 1])
+            RegSetValueExW( devices_key, name, 0, REG_SZ, (const BYTE *)ids[n - 1],
+                            (wcslen( ids[n - 1] ) + 1) * sizeof(WCHAR) );
+        else
+            RegDeleteValueW( devices_key, name );
+    }
+    if (RegQueryValueExW( arbiter_key, L"ComDB", NULL, &type, old_comdb, &size ) || type != REG_BINARY ||
+        size != sizeof(comdb) || memcmp( comdb, old_comdb, sizeof(comdb) ))
+        RegSetValueExW( arbiter_key, L"ComDB", 0, REG_BINARY, comdb, sizeof(comdb) );
+}
+
+static unsigned int find_port_number( unsigned int pass, const struct serial_port *port, const WCHAR *id,
+                                      WCHAR **ids, const BOOL *used, const BOOL *taken,
+                                      const BYTE *other_links )
+{
+    unsigned int n;
+
+    for (n = 1; n <= MAX_PORTS; n++)
+    {
+        if (used[n - 1] || taken[n - 1]) continue;
+        switch (pass)
+        {
+        case 0:  /* the number it had */
+            if (ids[n - 1] && !wcsicmp( ids[n - 1], id )) return n;
+            break;
+        case 1:  /* the number of a symlink that leads to it, the way drive letters are kept */
+            if (!ids[n - 1] && port_bit( port->links, n )) return n;
+            break;
+        case 2:  /* the lowest free number, leaving COM1 and COM2 to the legacy ports */
+            if (!ids[n - 1] && !port_bit( other_links, n ) && (n > 2 || wcsncmp( id, L"USB\\", 4 ))) return n;
+            break;
+        }
+    }
+    return 0;
+}
+
+/* find and create the serial ports; like on Windows, a device keeps its COM number from one
+ * session to the next */
+static void create_serial_port_devices( DRIVER_OBJECT *driver, const BOOL *used, HKEY *windows_ports_key )
+{
+    static const char * const reasons[] = { "known", "adopted", "new" };
+    char dosdev[8];
+    struct detect_serial_ports_params params = { NULL, MAX_PORTS };
+    struct set_dosdev_symlink_params link = { dosdev, NULL };
+    BOOL taken[MAX_PORTS] = { FALSE }, changed[MAX_PORTS] = { FALSE };
+    HKEY arbiter_key = NULL, devices_key = NULL;
+    struct port_number *numbers = NULL;
+    WCHAR *ids[MAX_PORTS] = { NULL };
+    unsigned int n, k, pass;
+    ULONG i, j, count = 0;
+
+    params.count = &count;
+    if (!(params.ports = calloc( MAX_PORTS, sizeof(*params.ports) ))) return;
+    MOUNTMGR_CALL( detect_serial_ports, &params );
+    if (!(numbers = calloc( count + 1, sizeof(*numbers) ))) goto done;
+
+    /* @@ Wine registry key: HKLM\System\CurrentControlSet\Control\COM Name Arbiter */
+    RegCreateKeyExW( HKEY_LOCAL_MACHINE, L"System\\CurrentControlSet\\Control\\COM Name Arbiter", 0, NULL, 0,
+                     KEY_ALL_ACCESS, NULL, &arbiter_key, NULL );
+    RegCreateKeyExW( arbiter_key, L"Devices", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &devices_key, NULL );
+    load_port_ids( devices_key, ids );
+
+    for (i = 0; i < count; i++)
+    {
+        MultiByteToWideChar( CP_UTF8, 0, params.ports[i].id, -1, numbers[i].id, ARRAY_SIZE(numbers[i].id) );
+        for (n = 1; n <= MAX_PORTS; n++)
+        {
+            if (!used[n - 1] || !port_bit( params.ports[i].links, n )) continue;
+            TRACE( "%s is COM%u already\n", debugstr_a(params.ports[i].device), n );
+            numbers[i].n = ~0u;
+            break;
+        }
+    }
+
+    for (pass = 0; pass < ARRAY_SIZE(reasons); pass++)
+    {
+        for (i = 0; i < count; i++)
+        {
+            if (numbers[i].n) continue;
+            if (!(n = find_port_number( pass, &params.ports[i], numbers[i].id, ids, used, taken,
+                                        params.other_links ))) continue;
+            numbers[i].n = n;
+            numbers[i].reason = reasons[pass];
+            taken[n - 1] = TRUE;
+        }
+    }
+
+    /* no free number left: take over the one of a device that is gone */
+    for (i = 0; i < count; i++)
+    {
+        if (numbers[i].n) continue;
+        for (n = 1; n <= MAX_PORTS; n++)
+        {
+            if (used[n - 1] || taken[n - 1] || !ids[n - 1] || port_bit( params.other_links, n )) continue;
+            for (j = 0; j < count; j++) if (!wcsicmp( ids[n - 1], numbers[j].id )) break;
+            if (j == count) break;
+        }
+        if (n > MAX_PORTS)
+        {
+            WARN( "no COM number left for %s\n", debugstr_w(numbers[i].id) );
+            continue;
+        }
+        WARN( "no free COM number left, giving COM%u of %s to %s\n", n, debugstr_w(ids[n - 1]),
+              debugstr_w(numbers[i].id) );
+        numbers[i].n = n;
+        numbers[i].reason = "taken over";
+        taken[n - 1] = TRUE;
+    }
+
+    for (i = 0; i < count; i++)
+    {
+        if (!(n = numbers[i].n) || n == ~0u) continue;
+        for (k = 1; k <= MAX_PORTS; k++)  /* a device has a single number */
+        {
+            if (k == n || !ids[k - 1] || wcsicmp( ids[k - 1], numbers[i].id )) continue;
+            if (used[k - 1])
+                WARN( "COM%u is a user-defined port, %s moves to COM%u\n", k, debugstr_w(numbers[i].id), n );
+            free( ids[k - 1] );
+            ids[k - 1] = NULL;
+            changed[k - 1] = TRUE;
+        }
+        if (!ids[n - 1] || wcsicmp( ids[n - 1], numbers[i].id ))
+        {
+            free( ids[n - 1] );
+            ids[n - 1] = wcsdup( numbers[i].id );
+            changed[n - 1] = TRUE;
+        }
+        TRACE( "COM%u: %s, %s (%s)\n", n, debugstr_w(numbers[i].id), debugstr_a(params.ports[i].path),
+               numbers[i].reason );
+        sprintf( dosdev, "com%u", n );
+        create_port_device( driver, n, params.ports[i].path, dosdev, windows_ports_key );
+    }
+
+    /* the symlink of a port that is gone would open whatever device gets its Unix name */
+    for (n = 1; n <= MAX_PORTS; n++)
+    {
+        if (used[n - 1] || taken[n - 1] || !port_bit( params.port_links, n )) continue;
+        TRACE( "removing com%u\n", n );
+        sprintf( dosdev, "com%u", n );
+        MOUNTMGR_CALL( set_dosdev_symlink, &link );
+    }
+
+    save_port_ids( arbiter_key, devices_key, ids, changed, used );
+    RegCloseKey( devices_key );
+    RegCloseKey( arbiter_key );
+    for (n = 0; n < MAX_PORTS; n++) free( ids[n] );
+done:
+    free( numbers );
+    free( params.ports );
+}
+
 /* find and create serial or parallel ports */
 static void create_port_devices( DRIVER_OBJECT *driver, const char *devices )
 {
@@ -2180,12 +2380,17 @@ static void create_port_devices( DRIVER_OBJECT *driver, const char *devices )
 
     /* look for ports in the usual places */
 
-    for (n = 1; *devices; n++, devices += strlen(devices) + 1)
+    if (driver == serial_driver)
+        create_serial_port_devices( driver, used, &windows_ports_key );
+    else
     {
-        while (n <= MAX_PORTS && used[n - 1]) n++;
-        if (n > MAX_PORTS) break;
-        sprintf( dosdev, dosdev_fmt, n );
-        create_port_device( driver, n, devices, dosdev, &windows_ports_key );
+        for (n = 1; *devices; n++, devices += strlen(devices) + 1)
+        {
+            while (n <= MAX_PORTS && used[n - 1]) n++;
+            if (n > MAX_PORTS) break;
+            sprintf( dosdev, dosdev_fmt, n );
+            create_port_device( driver, n, devices, dosdev, &windows_ports_key );
+        }
     }
 
     RegCloseKey( wine_ports_key );
@@ -2195,14 +2400,10 @@ static void create_port_devices( DRIVER_OBJECT *driver, const char *devices )
 /* driver entry point for the serial port driver */
 NTSTATUS WINAPI serial_driver_entry( DRIVER_OBJECT *driver, UNICODE_STRING *path )
 {
-    char devices[4096];
-    struct detect_ports_params params = { devices, sizeof(devices) };
-
     serial_driver = driver;
     /* TODO: fill in driver->MajorFunction */
 
-    MOUNTMGR_CALL( detect_serial_ports, &params );
-    create_port_devices( driver, devices );
+    create_port_devices( driver, NULL );
 
     return STATUS_SUCCESS;
 }
