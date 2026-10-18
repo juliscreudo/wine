@@ -26,6 +26,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -114,7 +115,8 @@ static BOOL is_valid_device( struct stat *st )
 #endif
 }
 
-static void detect_devices( const char **paths, char *names, ULONG size )
+static void detect_devices( const char **paths, BOOL (*is_port)( const char *unix_path ),
+                            char *names, ULONG size )
 {
     while (*paths)
     {
@@ -127,6 +129,7 @@ static void detect_devices( const char **paths, char *names, ULONG size )
             int len = snprintf( unix_path, sizeof(unix_path), *paths, i );
             if (len + 2 > size) break;
             if (access( unix_path, F_OK ) != 0) continue;
+            if (is_port && !is_port( unix_path )) continue;
             strcpy( names, unix_path );
             names += len + 1;
             size -= len + 1;
@@ -496,6 +499,35 @@ static NTSTATUS check_device_access( void *args )
     return STATUS_SUCCESS;
 }
 
+#ifdef linux
+static BOOL read_sysfs( const char *dir, const char *name, char *buffer, int size )
+{
+    char path[PATH_MAX];
+    int fd, len;
+
+    snprintf( path, sizeof(path), "%s/%s", dir, name );
+    if ((fd = open( path, O_RDONLY )) == -1) return FALSE;
+    len = read( fd, buffer, size - 1 );
+    close( fd );
+    if (len <= 0) return FALSE;
+    if (buffer[len - 1] == '\n') len--;
+    buffer[len] = 0;
+    return TRUE;
+}
+#endif
+
+static BOOL is_serial_port( const char *unix_path )
+{
+#ifdef linux
+    char dir[64], type[16];
+
+    /* the 8250 driver creates nr_uarts ttyS devices, with or without an UART behind them */
+    snprintf( dir, sizeof(dir), "/sys/class/tty/%s", strrchr( unix_path, '/' ) + 1 );
+    if (read_sysfs( dir, "type", type, sizeof(type) ) && !strcmp( type, "0" )) return FALSE;  /* PORT_UNKNOWN */
+#endif
+    return TRUE;
+}
+
 static NTSTATUS detect_serial_ports( void *args )
 {
     const struct detect_ports_params *params = args;
@@ -513,7 +545,7 @@ static NTSTATUS detect_serial_ports( void *args )
         NULL
     };
 
-    detect_devices( paths, params->names, params->size );
+    detect_devices( paths, is_serial_port, params->names, params->size );
     return STATUS_SUCCESS;
 }
 
@@ -528,7 +560,7 @@ static NTSTATUS detect_parallel_ports( void *args )
         NULL
     };
 
-    detect_devices( paths, params->names, params->size );
+    detect_devices( paths, NULL, params->names, params->size );
     return STATUS_SUCCESS;
 }
 
