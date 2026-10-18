@@ -24,6 +24,8 @@
 
 #include "config.h"
 
+#include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -528,9 +530,163 @@ static BOOL is_serial_port( const char *unix_path )
     return TRUE;
 }
 
+#ifdef linux
+/* the first udev symlink in name order that leads to the port */
+static BOOL find_port_link( const char *dir, struct serial_port *port )
+{
+    char path[PATH_MAX];
+    struct dirent *entry;
+    struct stat st;
+    BOOL found = FALSE;
+    DIR *d;
+
+    if (!(d = opendir( dir ))) return FALSE;
+    while ((entry = readdir( d )))
+    {
+        if (entry->d_name[0] == '.') continue;
+        snprintf( path, sizeof(path), "%s/%s", dir, entry->d_name );
+        if (stat( path, &st ) == -1 || !S_ISCHR( st.st_mode ) || st.st_rdev != port->unix_dev) continue;
+        if (strlen( path ) >= sizeof(port->path) || (found && strcmp( path, port->path ) >= 0)) continue;
+        strcpy( port->path, path );
+        found = TRUE;
+    }
+    closedir( d );
+    return found;
+}
+
+struct usb_port
+{
+    unsigned int vid, pid, interface, number;
+    BOOL         shared;        /* another port has the same serial number */
+    char         serial[128];
+    char         location[64];  /* host controller and hub ports, as in /dev/serial/by-path */
+};
+
+/* Windows ignores the serial numbers that can't be part of an instance id */
+static BOOL is_valid_usb_serial( const char *serial )
+{
+    if (!*serial) return FALSE;
+    for (; *serial; serial++)
+        if ((unsigned char)*serial < 0x20 || (unsigned char)*serial > 0x7f || *serial == ',') return FALSE;
+    return TRUE;
+}
+
+static BOOL get_usb_port( const char *name, struct usb_port *usb )
+{
+    char link[64], dir[PATH_MAX], devpath[32], buffer[16], *p;
+
+    snprintf( link, sizeof(link), "/sys/class/tty/%s/device", name );
+    if (!realpath( link, dir )) return FALSE;
+    if (read_sysfs( dir, "port_number", buffer, sizeof(buffer) )) usb->number = atoi( buffer );
+    while (!read_sysfs( dir, "bInterfaceNumber", buffer, sizeof(buffer) ))
+    {
+        if (!(p = strrchr( dir, '/' )) || p == dir) return FALSE;
+        *p = 0;
+    }
+    usb->interface = strtoul( buffer, NULL, 16 );
+    *strrchr( dir, '/' ) = 0;
+    if (!read_sysfs( dir, "idVendor", buffer, sizeof(buffer) )) return FALSE;
+    usb->vid = strtoul( buffer, NULL, 16 );
+    if (!read_sysfs( dir, "idProduct", buffer, sizeof(buffer) )) return FALSE;
+    usb->pid = strtoul( buffer, NULL, 16 );
+    if (!read_sysfs( dir, "serial", usb->serial, sizeof(usb->serial) ) || !is_valid_usb_serial( usb->serial ))
+        usb->serial[0] = 0;
+    if (!read_sysfs( dir, "devpath", devpath, sizeof(devpath) )) return FALSE;
+    /* the host controller is the parent of the root hub */
+    do
+    {
+        if (!(p = strrchr( dir, '/' ))) return FALSE;
+        *p = 0;
+    } while (strncmp( p + 1, "usb", 3 ) || !isdigit( p[4] ));
+    snprintf( usb->location, sizeof(usb->location), "%s-%s", strrchr( dir, '/' ) + 1, devpath );
+    return TRUE;
+}
+
+/* identify the USB ports like Windows does: by serial number, or by USB port when the device
+ * has none, or when another device has the same one */
+static void get_usb_port_ids( struct serial_port *ports, ULONG count )
+{
+    struct usb_port *usb;
+    ULONG i, j;
+    int len;
+
+    if (!(usb = calloc( count, sizeof(*usb) ))) return;
+    for (i = 0; i < count; i++)
+        if (!get_usb_port( strrchr( ports[i].device, '/' ) + 1, &usb[i] )) memset( &usb[i], 0, sizeof(usb[i]) );
+
+    for (i = 0; i < count; i++)
+        for (j = i + 1; j < count; j++)
+            if (usb[i].serial[0] && usb[i].vid == usb[j].vid && usb[i].pid == usb[j].pid &&
+                usb[i].interface == usb[j].interface && usb[i].number == usb[j].number &&
+                !strcasecmp( usb[i].serial, usb[j].serial ))
+                usb[i].shared = usb[j].shared = TRUE;
+
+    for (i = 0; i < count; i++)
+    {
+        struct serial_port *port = &ports[i];
+
+        if (!usb[i].location[0]) continue;
+        len = snprintf( port->id, sizeof(port->id), "USB\\VID_%04X&PID_%04X&MI_%02X\\",
+                        usb[i].vid, usb[i].pid, usb[i].interface );
+        if (usb[i].serial[0] && !usb[i].shared)
+        {
+            len += snprintf( port->id + len, sizeof(port->id) - len, "%s", usb[i].serial );
+            if (!find_port_link( "/dev/serial/by-id", port )) find_port_link( "/dev/serial/by-path", port );
+        }
+        else
+        {
+            len += snprintf( port->id + len, sizeof(port->id) - len, "@%s", usb[i].location );
+            find_port_link( "/dev/serial/by-path", port );
+        }
+        if (usb[i].number) snprintf( port->id + len, sizeof(port->id) - len, "#%u", usb[i].number );
+    }
+    free( usb );
+}
+#endif
+
+/* a symlink that mountmgr creates for a serial port: to a device it looks for, or to a udev link */
+static BOOL is_serial_port_link( const char *target, const char **paths )
+{
+    if (!strncmp( target, "/dev/serial/", 12 )) return TRUE;
+    for (; *paths; paths++)
+    {
+        size_t len = strchr( *paths, '%' ) - *paths;
+
+        if (!strncmp( target, *paths, len ) && target[len] &&
+            !target[len + strspn( target + len, "0123456789" )]) return TRUE;
+    }
+    return FALSE;
+}
+
+static void get_port_links( struct detect_serial_ports_params *params, const char **paths, ULONG count )
+{
+    char *path, *name, target[PATH_MAX];
+    unsigned int n, byte, bit;
+    struct stat st;
+    ULONG i;
+    int len;
+
+    if (!(path = get_dosdevices_path( "com256" ))) return;
+    name = path + strlen( path ) - 6;
+    for (n = 1; n <= MAX_PORTS; n++)
+    {
+        byte = (n - 1) / 8;
+        bit = 1 << ((n - 1) % 8);
+        sprintf( name, "com%u", n );
+        if ((len = readlink( path, target, sizeof(target) - 1 )) == -1) continue;
+        target[len] = 0;
+        if (is_serial_port_link( target, paths )) params->port_links[byte] |= bit;
+        else params->other_links[byte] |= bit;
+        if (stat( path, &st ) == -1 || !S_ISCHR( st.st_mode )) continue;
+        for (i = 0; i < count; i++)
+            if (params->ports[i].unix_dev == st.st_rdev) params->ports[i].links[byte] |= bit;
+    }
+    free( path );
+}
+
 static NTSTATUS detect_serial_ports( void *args )
 {
-    const struct detect_ports_params *params = args;
+    struct detect_serial_ports_params *params = args;
     static const char *paths[] =
     {
 #ifdef linux
@@ -544,8 +700,28 @@ static NTSTATUS detect_serial_ports( void *args )
 #endif
         NULL
     };
+    char names[4096], *name;
+    ULONG count = 0;
 
-    detect_devices( paths, is_serial_port, params->names, params->size );
+    detect_devices( paths, is_serial_port, names, sizeof(names) );
+    for (name = names; *name && count < params->size; name += strlen( name ) + 1)
+    {
+        struct serial_port *port = &params->ports[count];
+        struct stat st;
+
+        if (stat( name, &st ) == -1 || strlen( name ) >= sizeof(port->device)) continue;
+        memset( port, 0, sizeof(*port) );
+        strcpy( port->device, name );
+        strcpy( port->path, name );
+        snprintf( port->id, sizeof(port->id), "TTY\\%s", strrchr( name, '/' ) + 1 );
+        port->unix_dev = st.st_rdev;
+        count++;
+    }
+#ifdef linux
+    get_usb_port_ids( params->ports, count );
+#endif
+    get_port_links( params, paths, count );
+    *params->count = count;
     return STATUS_SUCCESS;
 }
 

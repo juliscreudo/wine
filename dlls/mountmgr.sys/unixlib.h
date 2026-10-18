@@ -138,6 +138,24 @@ struct detect_ports_params
     ULONG size;
 };
 
+struct serial_port
+{
+    char      device[32];               /* Unix device */
+    char      path[256];                /* target of the dosdevices symlink */
+    char      id[256];                  /* device instance id */
+    ULONGLONG unix_dev;
+    BYTE      links[MAX_PORTS / 8];     /* comN symlinks that lead to the port */
+};
+
+struct detect_serial_ports_params
+{
+    struct serial_port *ports;
+    ULONG               size;
+    ULONG              *count;
+    BYTE                port_links[MAX_PORTS / 8];  /* comN symlinks to serial ports, present or not */
+    BYTE                other_links[MAX_PORTS / 8]; /* comN symlinks to anything else */
+};
+
 struct set_shell_folder_params
 {
     const WCHAR *folder;
