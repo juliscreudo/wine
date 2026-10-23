@@ -29,10 +29,15 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <sys/stat.h>
+#ifdef HAVE_SYS_INOTIFY_H
+#include <sys/inotify.h>
+#endif
 #ifdef HAVE_SYS_STATFS_H
 #include <sys/statfs.h>
 #endif
@@ -312,8 +317,15 @@ static NTSTATUS set_dosdev_symlink( void *args )
 
     if (params->dest && params->dest[0])
     {
-        unlink( path );
-        if (symlink( params->dest, path ) == -1) status = STATUS_ACCESS_DENIED;
+        char target[PATH_MAX];
+        int len = readlink( path, target, sizeof(target) );
+
+        /* replacing the symlink with the same one would make it go missing for a moment */
+        if (len != strlen( params->dest ) || memcmp( target, params->dest, len ))
+        {
+            unlink( path );
+            if (symlink( params->dest, path ) == -1) status = STATUS_ACCESS_DENIED;
+        }
     }
     else unlink( path );
 
@@ -644,6 +656,20 @@ static void get_usb_port_ids( struct serial_port *ports, ULONG count )
 }
 #endif
 
+static const char *serial_port_paths[] =
+{
+#ifdef linux
+    "/dev/ttyS%u",
+    "/dev/ttyUSB%u",
+    "/dev/ttyACM%u",
+#elif defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
+    "/dev/cuau%u",
+#elif defined(__DragonFly__)
+    "/dev/cuaa%u",
+#endif
+    NULL
+};
+
 /* a symlink that mountmgr creates for a serial port: to a device it looks for, or to a udev link */
 static BOOL is_serial_port_link( const char *target, const char **paths )
 {
@@ -677,7 +703,9 @@ static void get_port_links( struct detect_serial_ports_params *params, const cha
         target[len] = 0;
         if (is_serial_port_link( target, paths )) params->port_links[byte] |= bit;
         else params->other_links[byte] |= bit;
-        if (stat( path, &st ) == -1 || !S_ISCHR( st.st_mode )) continue;
+        if (stat( path, &st ) == -1) continue;
+        params->live_links[byte] |= bit;
+        if (!S_ISCHR( st.st_mode )) continue;
         for (i = 0; i < count; i++)
             if (params->ports[i].unix_dev == st.st_rdev) params->ports[i].links[byte] |= bit;
     }
@@ -687,23 +715,10 @@ static void get_port_links( struct detect_serial_ports_params *params, const cha
 static NTSTATUS detect_serial_ports( void *args )
 {
     struct detect_serial_ports_params *params = args;
-    static const char *paths[] =
-    {
-#ifdef linux
-        "/dev/ttyS%u",
-        "/dev/ttyUSB%u",
-        "/dev/ttyACM%u",
-#elif defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
-        "/dev/cuau%u",
-#elif defined(__DragonFly__)
-        "/dev/cuaa%u",
-#endif
-        NULL
-    };
     char names[4096], *name;
     ULONG count = 0;
 
-    detect_devices( paths, is_serial_port, names, sizeof(names) );
+    detect_devices( serial_port_paths, is_serial_port, names, sizeof(names) );
     for (name = names; *name && count < params->size; name += strlen( name ) + 1)
     {
         struct serial_port *port = &params->ports[count];
@@ -720,7 +735,7 @@ static NTSTATUS detect_serial_ports( void *args )
 #ifdef linux
     get_usb_port_ids( params->ports, count );
 #endif
-    get_port_links( params, paths, count );
+    get_port_links( params, serial_port_paths, count );
     *params->count = count;
     return STATUS_SUCCESS;
 }
@@ -738,6 +753,195 @@ static NTSTATUS detect_parallel_ports( void *args )
 
     detect_devices( paths, NULL, params->names, params->size );
     return STATUS_SUCCESS;
+}
+
+#ifdef HAVE_SYS_INOTIFY_H
+static int port_watch_fd = -1;
+static struct
+{
+    int   wd;
+    char *dir;
+} port_watches[16];
+static unsigned int port_watch_count;
+
+#define MAX_HELD_PORTS 8
+
+struct held_port
+{
+    char      path[256];
+    ULONGLONG until;
+};
+
+static ULONGLONG get_monotonic_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return ts.tv_sec * (ULONGLONG)1000 + ts.tv_nsec / 1000000;
+}
+
+static void add_port_watch( const char *dir )
+{
+    unsigned int i;
+    char *copy;
+    int wd;
+
+    if ((wd = inotify_add_watch( port_watch_fd, dir, IN_CREATE | IN_DELETE | IN_MOVE | IN_ATTRIB )) == -1) return;
+    for (i = 0; i < port_watch_count; i++) if (port_watches[i].wd == wd) return;
+    if (port_watch_count == ARRAY_SIZE(port_watches) || !(copy = strdup( dir )))
+    {
+        inotify_rm_watch( port_watch_fd, wd );
+        return;
+    }
+    port_watches[port_watch_count].wd = wd;
+    port_watches[port_watch_count].dir = copy;
+    port_watch_count++;
+}
+
+static void remove_port_watch( int wd )
+{
+    unsigned int i;
+
+    for (i = 0; i < port_watch_count; i++)
+    {
+        if (port_watches[i].wd != wd) continue;
+        free( port_watches[i].dir );
+        port_watches[i] = port_watches[--port_watch_count];
+        return;
+    }
+}
+
+/* the directories of the device nodes, of the udev symlinks, which come and go with them,
+ * and of the targets of the user-defined ports */
+static void add_port_watches( const char *user_paths )
+{
+    char dir[PATH_MAX], *p;
+    const char *path;
+
+    add_port_watch( "/dev" );
+    add_port_watch( "/dev/serial" );
+    add_port_watch( "/dev/serial/by-id" );
+    add_port_watch( "/dev/serial/by-path" );
+    for (path = user_paths; *path; path += strlen( path ) + 1)
+    {
+        if (strlen( path ) >= sizeof(dir) || !(p = strrchr( strcpy( dir, path ), '/' )) || p == dir) continue;
+        *p = 0;
+        add_port_watch( dir );
+    }
+}
+
+/* whether the event is about something that detect_serial_ports looks at, or a user-defined port */
+static BOOL is_port_event( const struct inotify_event *event, const char *user_paths, char *path, size_t size )
+{
+    unsigned int i;
+
+    if (!event->len) return FALSE;
+    for (i = 0; i < port_watch_count; i++) if (port_watches[i].wd == event->wd) break;
+    if (i == port_watch_count) return FALSE;
+    snprintf( path, size, "%s/%s", port_watches[i].dir, event->name );
+    if (!strcmp( path, "/dev/serial" ) || is_serial_port_link( path, serial_port_paths )) return TRUE;
+    for (; *user_paths; user_paths += strlen( user_paths ) + 1) if (!strcmp( path, user_paths )) return TRUE;
+    return FALSE;
+}
+
+/* udev sets the permissions of a device node after creating it; until then, opening the port
+ * would fail, so a node that can't be opened yet holds the update back for up to a second */
+static void hold_port( const char *path, struct held_port *held, unsigned int *count, ULONGLONG now )
+{
+    unsigned int i;
+
+    if (!access( path, R_OK | W_OK ) || access( path, F_OK )) return;
+    for (i = 0; i < *count; i++) if (!strcmp( held[i].path, path )) return;
+    if (*count == MAX_HELD_PORTS || strlen( path ) >= sizeof(held->path)) return;
+    strcpy( held[*count].path, path );
+    held[(*count)++].until = now + 1000;
+}
+
+/* returns whether one of the pending events is about the serial ports */
+static BOOL read_port_events( const char *user_paths, struct held_port *held, unsigned int *count )
+{
+    union
+    {
+        struct inotify_event event;
+        char storage[4096];
+    } buf;
+    const struct inotify_event *event;
+    char path[PATH_MAX];
+    ssize_t bytes, pos;
+    BOOL ret = FALSE;
+
+    while ((bytes = read( port_watch_fd, &buf, sizeof(buf) )) > 0)
+    {
+        for (pos = 0; pos < bytes; pos += sizeof(*event) + event->len)
+        {
+            event = (const struct inotify_event *)(buf.storage + pos);
+            if (event->mask & IN_Q_OVERFLOW) ret = TRUE;
+            if (event->mask & IN_IGNORED) remove_port_watch( event->wd );
+            if (!is_port_event( event, user_paths, path, sizeof(path) )) continue;
+            ret = TRUE;
+            if (event->mask & IN_ISDIR) add_port_watches( user_paths );
+            else if (event->mask & (IN_CREATE | IN_MOVED_TO | IN_ATTRIB))
+                hold_port( path, held, count, get_monotonic_ms() );
+        }
+    }
+    return ret;
+}
+#endif
+
+/* waits until the serial ports change, and things settle: a burst of events (a hub with
+ * several devices, a device and its udev symlinks) is reported once */
+static NTSTATUS watch_serial_ports( void *args )
+{
+#ifdef HAVE_SYS_INOTIFY_H
+    const struct watch_serial_ports_params *params = args;
+    struct held_port held[MAX_HELD_PORTS];
+    unsigned int i, held_count = 0;
+    ULONGLONG now, last = 0, until;
+    struct pollfd pfd;
+    int timeout;
+
+    if (port_watch_fd == -1)
+    {
+        if ((port_watch_fd = inotify_init1( IN_NONBLOCK | IN_CLOEXEC )) == -1)
+        {
+            WARN( "no inotify, serial ports are only detected at startup: %s\n", strerror( errno ) );
+            return STATUS_NOT_SUPPORTED;
+        }
+        add_port_watches( params->paths );
+        /* the ports may have changed since they were detected */
+        return STATUS_SUCCESS;
+    }
+    add_port_watches( params->paths );
+
+    pfd.fd = port_watch_fd;
+    pfd.events = POLLIN;
+    for (;;)
+    {
+        timeout = -1;
+        if (last)
+        {
+            now = get_monotonic_ms();
+            until = last + 100;
+            for (i = held_count; i--;)
+            {
+                if (!access( held[i].path, R_OK | W_OK ) || access( held[i].path, F_OK ) || held[i].until <= now)
+                    held[i] = held[--held_count];
+                else if (held[i].until > until) until = held[i].until;
+            }
+            if (until <= now) break;
+            timeout = until - now;
+        }
+        if (poll( &pfd, 1, timeout ) == -1)
+        {
+            if (errno == EINTR) continue;
+            return errno_to_status( errno );
+        }
+        if (read_port_events( params->paths, held, &held_count )) last = get_monotonic_ms();
+    }
+    return STATUS_SUCCESS;
+#else
+    return STATUS_NOT_SUPPORTED;
+#endif
 }
 
 static NTSTATUS set_shell_folder( void *args )
@@ -836,6 +1040,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     cdrom_ioctl,
     detect_serial_ports,
     detect_parallel_ports,
+    watch_serial_ports,
     set_shell_folder,
     get_shell_folder,
     dhcp_request,
