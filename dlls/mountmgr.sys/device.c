@@ -117,6 +117,17 @@ static DRIVER_OBJECT *disk_driver;
 static DRIVER_OBJECT *serial_driver;
 static DRIVER_OBJECT *parallel_driver;
 
+/* a COM number of the serial driver */
+struct com_port
+{
+    DEVICE_OBJECT *device;  /* \Device\SerialN, kept when the port goes away */
+    char          *path;    /* target of the dosdevices symlink, while the port is listed */
+    WCHAR         *id;      /* device instance id, NULL for a user-defined port */
+};
+
+static struct com_port com_ports[MAX_PORTS];
+static char *user_port_paths;  /* targets of the user-defined ports, for watch_serial_ports */
+
 static CRITICAL_SECTION device_section;
 static CRITICAL_SECTION_DEBUG critsect_debug =
 {
@@ -2094,11 +2105,15 @@ static BOOL create_port_device( DRIVER_OBJECT *driver, int n, const char *unix_p
     /* create NT device */
     swprintf( nt_buffer, ARRAY_SIZE(nt_buffer), nt_name_format, n - 1 );
     RtlInitUnicodeString( &nt_name, nt_buffer );
-    status = IoCreateDevice( driver, 0, &nt_name, 0, 0, FALSE, &dev_obj );
-    if (status != STATUS_SUCCESS)
+    if (driver != serial_driver || !com_ports[n - 1].device)
     {
-        FIXME( "IoCreateDevice %s got %lx\n", debugstr_w(nt_name.Buffer), status );
-        return FALSE;
+        status = IoCreateDevice( driver, 0, &nt_name, 0, 0, FALSE, &dev_obj );
+        if (status != STATUS_SUCCESS)
+        {
+            FIXME( "IoCreateDevice %s got %lx\n", debugstr_w(nt_name.Buffer), status );
+            return FALSE;
+        }
+        if (driver == serial_driver) com_ports[n - 1].device = dev_obj;
     }
     swprintf( symlink_buffer, ARRAY_SIZE(symlink_buffer), symlink_format, n );
     RtlInitUnicodeString( &symlink_name, symlink_buffer );
@@ -2121,6 +2136,65 @@ static BOOL create_port_device( DRIVER_OBJECT *driver, int n, const char *unix_p
                     (BYTE *)reg_value, (lstrlenW( reg_value ) + 1) * sizeof(WCHAR) );
 
     return TRUE;
+}
+
+/* unlist a serial port that is gone; its device stays, for when it comes back */
+static void remove_serial_port( unsigned int n, HKEY *windows_ports_key )
+{
+    struct com_port *port = &com_ports[n - 1];
+    WCHAR nt_buffer[32], symlink_buffer[32];
+    UNICODE_STRING name;
+
+    TRACE( "COM%u: %s is gone\n", n, debugstr_a(port->path) );
+    if (!*windows_ports_key)
+        RegCreateKeyExW( HKEY_LOCAL_MACHINE, L"HARDWARE\\DEVICEMAP\\SERIALCOMM", 0, NULL, REG_OPTION_VOLATILE,
+                         KEY_ALL_ACCESS, NULL, windows_ports_key, NULL );
+    swprintf( nt_buffer, ARRAY_SIZE(nt_buffer), L"\\Device\\Serial%u", n - 1 );
+    RegDeleteValueW( *windows_ports_key, nt_buffer );
+
+    swprintf( symlink_buffer, ARRAY_SIZE(symlink_buffer), L"\\DosDevices\\COM%u", n );
+    RtlInitUnicodeString( &name, symlink_buffer );
+    IoDeleteSymbolicLink( &name );
+    if (n == 1)
+    {
+        RtlInitUnicodeString( &name, L"\\DosDevices\\AUX" );
+        IoDeleteSymbolicLink( &name );
+    }
+
+    free( port->path );
+    free( port->id );
+    port->path = NULL;
+    port->id = NULL;
+}
+
+/* list, unlist or update the port of a COM number; path is NULL when it has none */
+static void update_serial_port( DRIVER_OBJECT *driver, unsigned int n, const char *path, const WCHAR *id,
+                                HKEY *windows_ports_key )
+{
+    struct com_port *port = &com_ports[n - 1];
+    struct set_dosdev_symlink_params link;
+    char dosdev[8];
+
+    /* the number may go to another device when no free one is left */
+    if (port->path && (!path || !id != !port->id || (id && wcsicmp( id, port->id ))))
+        remove_serial_port( n, windows_ports_key );
+    if (!path) return;
+
+    sprintf( dosdev, "com%u", n );
+    if (!port->path)
+    {
+        if (!create_port_device( driver, n, path, dosdev, windows_ports_key )) return;
+        port->path = strdup( path );
+        port->id = id ? wcsdup( id ) : NULL;
+    }
+    else if (strcmp( port->path, path ))  /* the same device, through a udev symlink that came later */
+    {
+        link.dev = dosdev;
+        link.dest = path;
+        if (MOUNTMGR_CALL( set_dosdev_symlink, &link )) return;
+        free( port->path );
+        port->path = strdup( path );
+    }
 }
 
 struct port_number
@@ -2208,15 +2282,18 @@ static unsigned int find_port_number( unsigned int pass, const struct serial_por
     return 0;
 }
 
-/* find and create the serial ports; like on Windows, a device keeps its COM number from one
- * session to the next */
-static void create_serial_port_devices( DRIVER_OBJECT *driver, const BOOL *used, HKEY *windows_ports_key )
+/* find the serial ports and list the ones that came, unlist the ones that went; like on Windows,
+ * a device keeps its COM number from one session to the next */
+static void create_serial_port_devices( DRIVER_OBJECT *driver, const BOOL *used, char **user_paths,
+                                        HKEY *windows_ports_key )
 {
     static const char * const reasons[] = { "known", "adopted", "new" };
     char dosdev[8];
     struct detect_serial_ports_params params = { NULL, MAX_PORTS };
     struct set_dosdev_symlink_params link = { dosdev, NULL };
     BOOL taken[MAX_PORTS] = { FALSE }, changed[MAX_PORTS] = { FALSE };
+    const char *paths[MAX_PORTS] = { NULL };
+    const WCHAR *port_ids[MAX_PORTS] = { NULL };
     HKEY arbiter_key = NULL, devices_key = NULL;
     struct port_number *numbers = NULL;
     WCHAR *ids[MAX_PORTS] = { NULL };
@@ -2301,8 +2378,8 @@ static void create_serial_port_devices( DRIVER_OBJECT *driver, const BOOL *used,
         }
         TRACE( "COM%u: %s, %s (%s)\n", n, debugstr_w(numbers[i].id), debugstr_a(params.ports[i].path),
                numbers[i].reason );
-        sprintf( dosdev, "com%u", n );
-        create_port_device( driver, n, params.ports[i].path, dosdev, windows_ports_key );
+        paths[n - 1] = params.ports[i].path;
+        port_ids[n - 1] = numbers[i].id;
     }
 
     /* the symlink of a port that is gone would open whatever device gets its Unix name */
@@ -2314,6 +2391,14 @@ static void create_serial_port_devices( DRIVER_OBJECT *driver, const BOOL *used,
         MOUNTMGR_CALL( set_dosdev_symlink, &link );
     }
 
+    /* list the ports that came and unlist the ones that went; a user-defined port is listed
+     * while its target is there */
+    for (n = 1; n <= MAX_PORTS; n++)
+    {
+        if (used[n - 1] && port_bit( params.live_links, n )) paths[n - 1] = user_paths[n - 1];
+        update_serial_port( driver, n, paths[n - 1], port_ids[n - 1], windows_ports_key );
+    }
+
     save_port_ids( arbiter_key, devices_key, ids, changed, used );
     RegCloseKey( devices_key );
     RegCloseKey( arbiter_key );
@@ -2323,13 +2408,15 @@ done:
     free( params.ports );
 }
 
-/* find and create serial or parallel ports */
+/* find and create serial or parallel ports; the serial ports are found again whenever they change */
 static void create_port_devices( DRIVER_OBJECT *driver, const char *devices )
 {
     const char *dosdev_fmt;
-    char dosdev[8];
+    char dosdev[8], *user_paths[MAX_PORTS] = { NULL }, *p;
     HKEY wine_ports_key = NULL, windows_ports_key = NULL;
+    struct set_dosdev_symlink_params link = { dosdev, NULL };
     char unix_path[256];
+    size_t len = 1;
     const WCHAR *port_prefix;
     WCHAR reg_value[256];
     BOOL used[MAX_PORTS];
@@ -2375,13 +2462,35 @@ static void create_port_devices( DRIVER_OBJECT *driver, const char *devices )
 
         used[n - 1] = TRUE;
         sprintf( dosdev, dosdev_fmt, n );
-        create_port_device( driver, n, unix_path, dosdev, &windows_ports_key );
+        if (driver == serial_driver)
+        {
+            /* the symlink tells whether the target is there */
+            link.dest = unix_path;
+            MOUNTMGR_CALL( set_dosdev_symlink, &link );
+            if ((user_paths[n - 1] = strdup( unix_path ))) len += strlen( unix_path ) + 1;
+        }
+        else create_port_device( driver, n, unix_path, dosdev, &windows_ports_key );
     }
 
     /* look for ports in the usual places */
 
     if (driver == serial_driver)
-        create_serial_port_devices( driver, used, &windows_ports_key );
+    {
+        create_serial_port_devices( driver, used, user_paths, &windows_ports_key );
+
+        free( user_port_paths );
+        if ((user_port_paths = p = malloc( len )))
+        {
+            for (n = 0; n < MAX_PORTS; n++)
+            {
+                if (!user_paths[n]) continue;
+                strcpy( p, user_paths[n] );
+                p += strlen( p ) + 1;
+            }
+            *p = 0;
+        }
+        for (n = 0; n < MAX_PORTS; n++) free( user_paths[n] );
+    }
     else
     {
         for (n = 1; *devices; n++, devices += strlen(devices) + 1)
@@ -2405,6 +2514,19 @@ static NTSTATUS WINAPI serial_create( DEVICE_OBJECT *device, IRP *irp )
     return STATUS_OBJECT_NAME_NOT_FOUND;
 }
 
+static DWORD WINAPI serial_watch_thread( void *arg )
+{
+    struct watch_serial_ports_params params;
+
+    for (;;)
+    {
+        params.paths = user_port_paths ? user_port_paths : "";
+        if (MOUNTMGR_CALL( watch_serial_ports, &params )) break;
+        create_port_devices( serial_driver, NULL );
+    }
+    return 0;
+}
+
 /* driver entry point for the serial port driver */
 NTSTATUS WINAPI serial_driver_entry( DRIVER_OBJECT *driver, UNICODE_STRING *path )
 {
@@ -2412,6 +2534,7 @@ NTSTATUS WINAPI serial_driver_entry( DRIVER_OBJECT *driver, UNICODE_STRING *path
     driver->MajorFunction[IRP_MJ_CREATE] = serial_create;
 
     create_port_devices( driver, NULL );
+    CloseHandle( CreateThread( NULL, 0, serial_watch_thread, NULL, 0, NULL ));
 
     return STATUS_SUCCESS;
 }

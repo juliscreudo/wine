@@ -154,6 +154,12 @@ struct detect_serial_ports_params
     ULONG              *count;
     BYTE                port_links[MAX_PORTS / 8];  /* comN symlinks to serial ports, present or not */
     BYTE                other_links[MAX_PORTS / 8]; /* comN symlinks to anything else */
+    BYTE                live_links[MAX_PORTS / 8];  /* comN symlinks that lead to something */
+};
+
+struct watch_serial_ports_params
+{
+    const char *paths;  /* targets of the user-defined ports, each null-terminated, then an empty one */
 };
 
 struct set_shell_folder_params
@@ -205,6 +211,7 @@ enum mountmgr_funcs
     unix_cdrom_ioctl,
     unix_detect_serial_ports,
     unix_detect_parallel_ports,
+    unix_watch_serial_ports,
     unix_set_shell_folder,
     unix_get_shell_folder,
     unix_dhcp_request,
