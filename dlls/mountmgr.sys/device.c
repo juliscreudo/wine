@@ -2398,11 +2398,19 @@ static void create_port_devices( DRIVER_OBJECT *driver, const char *devices )
     RegCloseKey( windows_ports_key );
 }
 
+/* a port is opened through its dosdevices symlink, so this is only reached when its device is gone */
+static NTSTATUS WINAPI serial_create( DEVICE_OBJECT *device, IRP *irp )
+{
+    irp->IoStatus.Status = STATUS_OBJECT_NAME_NOT_FOUND;
+    IoCompleteRequest( irp, IO_NO_INCREMENT );
+    return STATUS_OBJECT_NAME_NOT_FOUND;
+}
+
 /* driver entry point for the serial port driver */
 NTSTATUS WINAPI serial_driver_entry( DRIVER_OBJECT *driver, UNICODE_STRING *path )
 {
     serial_driver = driver;
-    /* TODO: fill in driver->MajorFunction */
+    driver->MajorFunction[IRP_MJ_CREATE] = serial_create;
 
     create_port_devices( driver, NULL );
 
