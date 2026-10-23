@@ -123,6 +123,8 @@ struct com_port
     DEVICE_OBJECT *device;  /* \Device\SerialN, kept when the port goes away */
     char          *path;    /* target of the dosdevices symlink, while the port is listed */
     WCHAR         *id;      /* device instance id, NULL for a user-defined port */
+    BOOL           removed; /* not notified yet */
+    BOOL           arrived;
 };
 
 static struct com_port com_ports[MAX_PORTS];
@@ -143,6 +145,21 @@ static const GUID *get_default_uuid( int letter )
 
     guid.Data4[7] = 'A' + letter;
     return &guid;
+}
+
+/* send notification about a serial port that came or went */
+static void send_port_notify( unsigned int n, int code )
+{
+    BYTE buffer[offsetof( DEV_BROADCAST_PORT_W, dbcp_name[8] )];
+    DEV_BROADCAST_PORT_W *info = (DEV_BROADCAST_PORT_W *)buffer;
+    int len;
+
+    len = swprintf( info->dbcp_name, 8, L"COM%u", n );
+    info->dbcp_size       = offsetof( DEV_BROADCAST_PORT_W, dbcp_name[len + 1] );
+    info->dbcp_devicetype = DBT_DEVTYP_PORT;
+    info->dbcp_reserved   = 0;
+    BroadcastSystemMessageW( BSF_FORCEIFHUNG|BSF_QUERY, NULL,
+                             WM_DEVICECHANGE, code, (LPARAM)info );
 }
 
 /* send notification about a change to a given drive */
@@ -2165,6 +2182,7 @@ static void remove_serial_port( unsigned int n, HKEY *windows_ports_key )
     free( port->id );
     port->path = NULL;
     port->id = NULL;
+    port->removed = TRUE;
 }
 
 /* list, unlist or update the port of a COM number; path is NULL when it has none */
@@ -2186,6 +2204,7 @@ static void update_serial_port( DRIVER_OBJECT *driver, unsigned int n, const cha
         if (!create_port_device( driver, n, path, dosdev, windows_ports_key )) return;
         port->path = strdup( path );
         port->id = id ? wcsdup( id ) : NULL;
+        port->arrived = TRUE;
     }
     else if (strcmp( port->path, path ))  /* the same device, through a udev symlink that came later */
     {
@@ -2514,6 +2533,76 @@ static NTSTATUS WINAPI serial_create( DEVICE_OBJECT *device, IRP *irp )
     return STATUS_OBJECT_NAME_NOT_FOUND;
 }
 
+/* a port message waiting to be broadcast */
+struct port_notify
+{
+    struct list  entry;
+    unsigned int n;     /* COM number, 0 for DBT_DEVNODES_CHANGED */
+    int          code;
+};
+
+static struct list port_notifies = LIST_INIT(port_notifies);
+static SRWLOCK port_notify_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE port_notify_cv = CONDITION_VARIABLE_INIT;
+
+static void queue_port_notify( unsigned int n, int code )
+{
+    struct port_notify *notify;
+
+    if (!(notify = malloc( sizeof(*notify) ))) return;
+    notify->n = n;
+    notify->code = code;
+    AcquireSRWLockExclusive( &port_notify_lock );
+    list_add_tail( &port_notifies, &notify->entry );
+    ReleaseSRWLockExclusive( &port_notify_lock );
+    WakeConditionVariable( &port_notify_cv );
+}
+
+/* the windows may take seconds to answer, the ports must not wait for them */
+static DWORD WINAPI port_notify_thread( void *arg )
+{
+    struct port_notify *notify;
+    struct list *entry;
+
+    for (;;)
+    {
+        AcquireSRWLockExclusive( &port_notify_lock );
+        while (!(entry = list_head( &port_notifies )))
+            SleepConditionVariableSRW( &port_notify_cv, &port_notify_lock, INFINITE, 0 );
+        list_remove( entry );
+        ReleaseSRWLockExclusive( &port_notify_lock );
+
+        notify = LIST_ENTRY( entry, struct port_notify, entry );
+        if (notify->n) send_port_notify( notify->n, notify->code );
+        else BroadcastSystemMessageW( 0, NULL, WM_DEVICECHANGE, DBT_DEVNODES_CHANGED, 0 );
+        free( notify );
+    }
+    return 0;
+}
+
+/* like on Windows, the port messages come once SERIALCOMM has changed, then DBT_DEVNODES_CHANGED */
+static void notify_serial_ports( BOOL send )
+{
+    BOOL changed = FALSE;
+    unsigned int n;
+
+    for (n = 1; n <= MAX_PORTS; n++)
+    {
+        if (!com_ports[n - 1].removed) continue;
+        if (send) queue_port_notify( n, DBT_DEVICEREMOVECOMPLETE );
+        com_ports[n - 1].removed = FALSE;
+        changed = TRUE;
+    }
+    for (n = 1; n <= MAX_PORTS; n++)
+    {
+        if (!com_ports[n - 1].arrived) continue;
+        if (send) queue_port_notify( n, DBT_DEVICEARRIVAL );
+        com_ports[n - 1].arrived = FALSE;
+        changed = TRUE;
+    }
+    if (send && changed) queue_port_notify( 0, DBT_DEVNODES_CHANGED );
+}
+
 static DWORD WINAPI serial_watch_thread( void *arg )
 {
     struct watch_serial_ports_params params;
@@ -2523,6 +2612,7 @@ static DWORD WINAPI serial_watch_thread( void *arg )
         params.paths = user_port_paths ? user_port_paths : "";
         if (MOUNTMGR_CALL( watch_serial_ports, &params )) break;
         create_port_devices( serial_driver, NULL );
+        notify_serial_ports( TRUE );
     }
     return 0;
 }
@@ -2534,6 +2624,8 @@ NTSTATUS WINAPI serial_driver_entry( DRIVER_OBJECT *driver, UNICODE_STRING *path
     driver->MajorFunction[IRP_MJ_CREATE] = serial_create;
 
     create_port_devices( driver, NULL );
+    notify_serial_ports( FALSE );
+    CloseHandle( CreateThread( NULL, 0, port_notify_thread, NULL, 0, NULL ));
     CloseHandle( CreateThread( NULL, 0, serial_watch_thread, NULL, 0, NULL ));
 
     return STATUS_SUCCESS;
