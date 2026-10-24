@@ -138,6 +138,16 @@ struct detect_ports_params
     ULONG size;
 };
 
+/* the USB device of a serial port, as Windows enumerates it */
+struct serial_port_usb
+{
+    USHORT vid, pid, rev;
+    BYTE   interface;           /* interface of the port, when the device is composite */
+    BOOL   composite;
+    char   instance[160];       /* instance id: the serial number, or the USB port when there is none */
+    char   product[128];        /* iProduct */
+};
+
 struct serial_port
 {
     char      device[32];               /* Unix device */
@@ -145,6 +155,7 @@ struct serial_port
     char      id[256];                  /* device instance id */
     ULONGLONG unix_dev;
     BYTE      links[MAX_PORTS / 8];     /* comN symlinks that lead to the port */
+    struct serial_port_usb usb;         /* empty instance when the port is not on USB */
 };
 
 struct detect_serial_ports_params

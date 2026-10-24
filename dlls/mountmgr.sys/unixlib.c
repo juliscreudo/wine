@@ -568,9 +568,11 @@ static BOOL find_port_link( const char *dir, struct serial_port *port )
 
 struct usb_port
 {
-    unsigned int vid, pid, interface, number;
+    unsigned int vid, pid, rev, interface, number;
+    BOOL         composite;     /* Windows gives each interface a device of its own */
     BOOL         shared;        /* another port has the same serial number */
     char         serial[128];
+    char         product[128];
     char         location[64];  /* host controller and hub ports, as in /dev/serial/by-path */
 };
 
@@ -601,8 +603,18 @@ static BOOL get_usb_port( const char *name, struct usb_port *usb )
     usb->vid = strtoul( buffer, NULL, 16 );
     if (!read_sysfs( dir, "idProduct", buffer, sizeof(buffer) )) return FALSE;
     usb->pid = strtoul( buffer, NULL, 16 );
+    if (read_sysfs( dir, "bcdDevice", buffer, sizeof(buffer) )) usb->rev = strtoul( buffer, NULL, 16 );
+    if (read_sysfs( dir, "bNumInterfaces", buffer, sizeof(buffer) ) && strtoul( buffer, NULL, 10 ) > 1 &&
+        read_sysfs( dir, "bDeviceClass", buffer, sizeof(buffer) ))
+    {
+        /* like usbccgp: no device class, or the one of interface associations */
+        usb->composite = !strcmp( buffer, "00" ) || (!strcmp( buffer, "ef" ) &&
+                         read_sysfs( dir, "bDeviceSubClass", buffer, sizeof(buffer) ) && !strcmp( buffer, "02" ) &&
+                         read_sysfs( dir, "bDeviceProtocol", buffer, sizeof(buffer) ) && !strcmp( buffer, "01" ));
+    }
     if (!read_sysfs( dir, "serial", usb->serial, sizeof(usb->serial) ) || !is_valid_usb_serial( usb->serial ))
         usb->serial[0] = 0;
+    if (!read_sysfs( dir, "product", usb->product, sizeof(usb->product) )) usb->product[0] = 0;
     if (!read_sysfs( dir, "devpath", devpath, sizeof(devpath) )) return FALSE;
     /* the host controller is the parent of the root hub */
     do
@@ -620,6 +632,7 @@ static void get_usb_port_ids( struct serial_port *ports, ULONG count )
 {
     struct usb_port *usb;
     ULONG i, j;
+    char *p;
     int len;
 
     if (!(usb = calloc( count, sizeof(*usb) ))) return;
@@ -651,6 +664,24 @@ static void get_usb_port_ids( struct serial_port *ports, ULONG count )
             find_port_link( "/dev/serial/by-path", port );
         }
         if (usb[i].number) snprintf( port->id + len, sizeof(port->id) - len, "#%u", usb[i].number );
+
+        port->usb.vid = usb[i].vid;
+        port->usb.pid = usb[i].pid;
+        port->usb.rev = usb[i].rev;
+        port->usb.interface = usb[i].interface;
+        port->usb.composite = usb[i].composite;
+        strcpy( port->usb.product, usb[i].product );
+        if (usb[i].serial[0] && !usb[i].shared)
+            len = snprintf( port->usb.instance, sizeof(port->usb.instance), "%s", usb[i].serial );
+        else
+        {
+            /* the host controller, then the hub ports */
+            len = snprintf( port->usb.instance, sizeof(port->usb.instance), "%s", usb[i].location );
+            for (p = port->usb.instance; *p; p++) if (*p == ':') *p = '.';
+            if ((p = strrchr( port->usb.instance, '-' ))) *p = '&';
+        }
+        if (usb[i].number && len < sizeof(port->usb.instance))
+            snprintf( port->usb.instance + len, sizeof(port->usb.instance) - len, "&%u", usb[i].number );
     }
     free( usb );
 }
