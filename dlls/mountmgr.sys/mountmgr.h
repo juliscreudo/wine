@@ -51,6 +51,8 @@ enum device_type
 
 extern NTSTATUS WINAPI disk_driver_entry( DRIVER_OBJECT *driver, UNICODE_STRING *path );
 extern NTSTATUS WINAPI serial_driver_entry( DRIVER_OBJECT *driver, UNICODE_STRING *path );
+extern NTSTATUS WINAPI serial_bus_add_device( DRIVER_OBJECT *driver, DEVICE_OBJECT *pdo );
+extern NTSTATUS WINAPI serial_bus_pnp( DEVICE_OBJECT *device, IRP *irp );
 extern NTSTATUS WINAPI parallel_driver_entry( DRIVER_OBJECT *driver, UNICODE_STRING *path );
 
 enum scsi_device_type
