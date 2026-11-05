@@ -1366,6 +1366,7 @@ NTSTATUS WINAPI IoSetDeviceInterfaceState( UNICODE_STRING *name, BOOLEAN enable 
         NtClose( control_key );
         return ret;
     }
+    NtClose( control_key );
 
     iface->enabled = enable;
 
