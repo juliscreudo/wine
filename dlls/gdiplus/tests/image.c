@@ -2047,6 +2047,209 @@ static const unsigned char raw_wmfimage[158] = {
 0x40,0x01,0x40,0x01,0x00,0x00,0x00,0x00,0x04,0x00,0x00,0x00,0xf0,0x01,0x00,0x00,
 0x04,0x00,0x00,0x00,0xf0,0x01,0x01,0x00,0x03,0x00,0x00,0x00,0x00,0x00
 };
+
+static DWORD ico_crc32(DWORD crc, const BYTE *data, DWORD len)
+{
+    unsigned int i;
+
+    crc = ~crc;
+    while (len--)
+    {
+        crc ^= *data++;
+        for (i = 0; i < 8; i++)
+            crc = (crc >> 1) ^ (0xedb88320 & (0u - (crc & 1)));
+    }
+    return ~crc;
+}
+
+static BYTE *ico_put_be32(BYTE *p, DWORD value)
+{
+    p[0] = value >> 24;
+    p[1] = value >> 16;
+    p[2] = value >> 8;
+    p[3] = value;
+    return p + 4;
+}
+
+static BYTE *ico_put_png_chunk(BYTE *p, const char *type, const BYTE *data, DWORD len)
+{
+    BYTE *start = p + 4;
+
+    p = ico_put_be32(p, len);
+    memcpy(p, type, 4);
+    p += 4;
+    if (len) memmove(p, data, len);
+    p += len;
+    return ico_put_be32(p, ico_crc32(0, start, len + 4));
+}
+
+/* Solid colour icon image: RGBA PNG with stored deflate blocks, or 32 bpp DIB. */
+static BYTE *build_ico_image(BOOL png, UINT size, DWORD *image_size)
+{
+    static const BYTE signature[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
+    DWORD row_len = 1 + size * 4, raw_len = row_len * size, blocks = (raw_len + 0xfffe) / 0xffff;
+    DWORD zlib_len = 2 + blocks * 5 + raw_len + 4, a = 1, b = 0, i, done;
+    BYTE *raw, *zlib, *image, *p, ihdr[13];
+
+    if (!png)
+    {
+        BITMAPINFOHEADER *bih;
+
+        *image_size = sizeof(*bih) + size * size * 4 + ((size + 31) / 32) * 4 * size;
+        image = calloc(1, *image_size);
+        bih = (BITMAPINFOHEADER *)image;
+        bih->biSize = sizeof(*bih);
+        bih->biWidth = size;
+        bih->biHeight = size * 2;
+        bih->biPlanes = 1;
+        bih->biBitCount = 32;
+        for (i = 0; i < size * size; i++)
+            *(DWORD *)(image + sizeof(*bih) + i * 4) = 0xff204080;
+        return image;
+    }
+
+    raw = malloc(raw_len);
+    for (i = 0; i < raw_len; i++)
+        raw[i] = (i % row_len) ? 0xff : 0;
+
+    zlib = p = malloc(zlib_len);
+    *p++ = 0x78;
+    *p++ = 0x01;
+    for (done = 0; done < raw_len; done += 0xffff)
+    {
+        DWORD len = min(raw_len - done, 0xffff);
+        *p++ = (done + len == raw_len);
+        *p++ = len & 0xff;
+        *p++ = len >> 8;
+        *p++ = ~len & 0xff;
+        *p++ = (~len >> 8) & 0xff;
+        memcpy(p, raw + done, len);
+        p += len;
+    }
+    for (i = 0; i < raw_len; i++)
+    {
+        a = (a + raw[i]) % 65521;
+        b = (b + a) % 65521;
+    }
+    ico_put_be32(p, (b << 16) | a);
+
+    ico_put_be32(ihdr, size);
+    ico_put_be32(ihdr + 4, size);
+    ihdr[8] = 8;
+    ihdr[9] = 6;
+    ihdr[10] = ihdr[11] = ihdr[12] = 0;
+
+    *image_size = sizeof(signature) + (12 + sizeof(ihdr)) + (12 + zlib_len) + 12;
+    image = p = malloc(*image_size);
+    memcpy(p, signature, sizeof(signature));
+    p += sizeof(signature);
+    p = ico_put_png_chunk(p, "IHDR", ihdr, sizeof(ihdr));
+    p = ico_put_png_chunk(p, "IDAT", zlib, zlib_len);
+    ico_put_png_chunk(p, "IEND", NULL, 0);
+
+    free(zlib);
+    free(raw);
+    return image;
+}
+
+/* layout: "p256 d16 d48", p = PNG, d = 32 bpp DIB, followed by the size. */
+static BYTE *build_ico(const char *layout, DWORD *ico_size)
+{
+    BYTE *images[16], *ico;
+    DWORD sizes[16], offset;
+    UINT dims[16], count = 0, i;
+    BOOL png[16];
+    char *end;
+
+    while (*layout && count < ARRAY_SIZE(images))
+    {
+        while (*layout == ' ') layout++;
+        if (!*layout) break;
+        png[count] = (*layout++ == 'p');
+        dims[count] = strtoul(layout, &end, 10);
+        layout = end;
+        count++;
+    }
+
+    *ico_size = offset = 6 + count * 16;
+    for (i = 0; i < count; i++)
+    {
+        images[i] = build_ico_image(png[i], dims[i], &sizes[i]);
+        *ico_size += sizes[i];
+    }
+
+    ico = calloc(1, *ico_size);
+    *(WORD *)(ico + 2) = 1;
+    *(WORD *)(ico + 4) = count;
+    for (i = 0; i < count; i++)
+    {
+        BYTE *entry = ico + 6 + i * 16;
+
+        entry[0] = entry[1] = dims[i];
+        *(WORD *)(entry + 4) = 1;
+        *(WORD *)(entry + 6) = 32;
+        *(DWORD *)(entry + 8) = sizes[i];
+        *(DWORD *)(entry + 12) = offset;
+        memcpy(ico + offset, images[i], sizes[i]);
+        offset += sizes[i];
+        free(images[i]);
+    }
+    return ico;
+}
+
+static GpImage *load_image(const BYTE *image_data, UINT image_size, BOOL valid_data, BOOL todo_load);
+
+static void test_ico_frame(void)
+{
+    static const struct
+    {
+        const char *layout;
+        UINT size;
+    }
+    td[] =
+    {
+        { "d16 d48", 48 },
+        { "d48 d16", 16 },
+        { "d16 d48 d32", 32 },
+        { "d32 d128 d16 d64", 64 },
+        { "d128 d96 d72 d64 d48 d32 d24 d16", 16 },
+        { "d16 d24 d32 d48 d64 d96 d128", 128 },
+        { "p256 d128 d96 d72 d64 d48 d32 d24 d16", 16 },
+        { "d128 d96 d72 d64 d48 d32 d24 d16 p256", 256 },
+        { "p256 d48 d32 d16", 16 },
+        { "d16 d32 d48 p256", 256 },
+        { "d48 p256 d16 d32", 32 },
+    };
+    UINT i, width, height;
+    GpImage *image;
+    GpStatus status;
+    DWORD ico_size;
+    BYTE *ico;
+
+    for (i = 0; i < ARRAY_SIZE(td); i++)
+    {
+        winetest_push_context("%s", td[i].layout);
+
+        ico = build_ico(td[i].layout, &ico_size);
+        image = load_image(ico, ico_size, TRUE, FALSE);
+        ok(image != NULL, "failed to load the icon\n");
+        if (image)
+        {
+            width = height = 0;
+            status = GdipGetImageWidth(image, &width);
+            expect(Ok, status);
+            status = GdipGetImageHeight(image, &height);
+            expect(Ok, status);
+            ok(width == td[i].size && height == td[i].size, "got %ux%u, expected %ux%u\n",
+                    width, height, td[i].size, td[i].size);
+            GdipDisposeImage(image);
+        }
+        free(ico);
+
+        winetest_pop_context();
+    }
+}
+
 static void test_getrawformat(void)
 {
     test_bufferrawformat((void*)pngimage, sizeof(pngimage), &ImageFormatPNG,  __LINE__, FALSE);
@@ -7469,6 +7672,7 @@ START_TEST(image)
     test_GdipCloneImage();
     test_testcontrol();
     test_fromhicon();
+    test_ico_frame();
     test_getrawformat();
     test_loadwmf();
     test_createfromwmf();
