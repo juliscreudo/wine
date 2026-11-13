@@ -59,6 +59,7 @@ typedef struct {
     BOOL initialized;
     IStream *stream;
     ICONHEADER header;
+    WORD *order; /* directory entry of each frame */
     CRITICAL_SECTION lock; /* must be held when accessing stream */
 } IcoDecoder;
 
@@ -480,6 +481,7 @@ static ULONG WINAPI IcoDecoder_Release(IWICBitmapDecoder *iface)
         This->lock.DebugInfo->Spare[0] = 0;
         DeleteCriticalSection(&This->lock);
         if (This->stream) IStream_Release(This->stream);
+        free(This->order);
         free(This);
     }
 
@@ -502,6 +504,109 @@ static HRESULT WINAPI IcoDecoder_QueryCapability(IWICBitmapDecoder *iface, IStre
     return S_OK;
 }
 
+struct ico_frame_info
+{
+    BOOL png;
+    LONGLONG size;
+    LONG bpp;
+};
+
+/* The size and bit depth of an image come from its own header, not from the
+ * directory entry. */
+static void get_frame_info(IStream *stream, const ICONDIRENTRY *entry, struct ico_frame_info *info)
+{
+    union
+    {
+        DWORD magic;
+        BITMAPCOREHEADER core;
+        BITMAPINFOHEADER bih;
+        BYTE png[20];
+    } header;
+    LARGE_INTEGER seek;
+    ULONG bytesread;
+
+    info->png = FALSE;
+    info->size = entry->bWidth ? entry->bWidth : 256;
+    info->bpp = entry->wBitCount;
+
+    seek.QuadPart = entry->dwDIBOffset;
+    if (FAILED(IStream_Seek(stream, seek, STREAM_SEEK_SET, NULL)) ||
+        FAILED(IStream_Read(stream, &header, min(sizeof(header), entry->dwDIBSize), &bytesread)) ||
+        bytesread < sizeof(header.magic))
+        return;
+
+    switch (header.magic)
+    {
+    case sizeof(BITMAPCOREHEADER):
+        if (bytesread < sizeof(header.core)) break;
+        info->size = header.core.bcWidth;
+        info->bpp = header.core.bcBitCount;
+        break;
+    case 64: /* sizeof(BITMAPCOREHEADER2) */
+    case sizeof(BITMAPINFOHEADER):
+    case sizeof(BITMAPV4HEADER):
+    case sizeof(BITMAPV5HEADER):
+        if (bytesread < sizeof(header.bih)) break;
+        info->size = header.bih.biWidth;
+        info->bpp = header.bih.biBitCount;
+        break;
+    case 0x474e5089:
+        if (bytesread < sizeof(header.png)) break;
+        info->png = TRUE;
+        info->size = ((DWORD)header.png[16] << 24) | (header.png[17] << 16) | (header.png[18] << 8) | header.png[19];
+        break;
+    }
+}
+
+/* Windows does not return the frames in file order. Each frame gets a key
+ * (scaled by 6 to keep it an integer), where M is the largest DIB size and B
+ * the largest DIB bit depth: DIB of size s and b bpp: min(s, M/2) - 2/3 (32 - b),
+ * PNG of size k: min(k, M) - k/3 - (32 - B). The frames are then sorted by a
+ * Shell sort with gaps n/2, n/4, ..., 1, where an entry moves on while its key
+ * is not greater than the key of the next entry (gap > 1) or of the inserted
+ * one (gap 1). */
+static void sort_frames(const struct ico_frame_info *frames, LONGLONG *keys, WORD *order, UINT count)
+{
+    LONGLONG max_size = 0;
+    LONG max_bpp = 32;
+    BOOL have_dib = FALSE;
+    UINT gap, i, j;
+
+    for (i = 0; i < count; i++)
+    {
+        if (frames[i].png) continue;
+        max_size = have_dib ? max(max_size, frames[i].size) : frames[i].size;
+        max_bpp = have_dib ? max(max_bpp, frames[i].bpp) : frames[i].bpp;
+        have_dib = TRUE;
+    }
+
+    for (i = 0; i < count; i++)
+    {
+        if (frames[i].png)
+            keys[i] = 6 * min(frames[i].size, max_size) - 2 * frames[i].size - 6 * (32 - (LONGLONG)max_bpp);
+        else
+            keys[i] = min(6 * frames[i].size, 3 * max_size) - 4 * (32 - (LONGLONG)frames[i].bpp);
+        order[i] = i;
+    }
+
+    for (gap = count / 2; gap; gap /= 2)
+    {
+        for (i = gap; i < count; i++)
+        {
+            WORD frame = order[i];
+
+            for (j = i; j >= gap; j -= gap)
+            {
+                LONGLONG next = gap == 1 ? keys[frame] : keys[order[j - gap + 1]];
+
+                if (keys[order[j - gap]] > next) break;
+                order[j] = order[j - gap];
+            }
+            order[j] = frame;
+        }
+    }
+}
+
 static HRESULT WINAPI IcoDecoder_Initialize(IWICBitmapDecoder *iface, IStream *pIStream,
     WICDecodeOptions cacheOptions)
 {
@@ -510,6 +615,10 @@ static HRESULT WINAPI IcoDecoder_Initialize(IWICBitmapDecoder *iface, IStream *p
     HRESULT hr;
     ULONG bytesread;
     STATSTG statstg;
+    ICONDIRENTRY *entries = NULL;
+    struct ico_frame_info *frames = NULL;
+    LONGLONG *keys = NULL;
+    WORD *order = NULL;
     unsigned int i;
 
     TRACE("(%p,%p,%x)\n", iface, pIStream, cacheOptions);
@@ -549,27 +658,48 @@ static HRESULT WINAPI IcoDecoder_Initialize(IWICBitmapDecoder *iface, IStream *p
         goto end;
     }
 
+    entries = malloc(This->header.idCount * sizeof(*entries));
+    frames = malloc(This->header.idCount * sizeof(*frames));
+    keys = malloc(This->header.idCount * sizeof(*keys));
+    order = malloc(This->header.idCount * sizeof(*order));
+    if (This->header.idCount && (!entries || !frames || !keys || !order))
+    {
+        hr = E_OUTOFMEMORY;
+        goto end;
+    }
+
     for (i = 0; i < This->header.idCount; i++)
     {
-        ICONDIRENTRY direntry;
+        ICONDIRENTRY *direntry = &entries[i];
 
-        hr = IStream_Read(pIStream, &direntry, sizeof(direntry), &bytesread);
+        hr = IStream_Read(pIStream, direntry, sizeof(*direntry), &bytesread);
         if (FAILED(hr)) goto end;
 
-        if (bytesread != sizeof(direntry) || (direntry.dwDIBSize + direntry.dwDIBOffset > statstg.cbSize.QuadPart))
+        if (bytesread != sizeof(*direntry) || (direntry->dwDIBSize + direntry->dwDIBOffset > statstg.cbSize.QuadPart))
         {
             hr = WINCODEC_ERR_BADIMAGE;
             goto end;
         }
     }
 
+    for (i = 0; i < This->header.idCount; i++)
+        get_frame_info(pIStream, &entries[i], &frames[i]);
+    sort_frames(frames, keys, order, This->header.idCount);
+
     This->initialized = TRUE;
     This->stream = pIStream;
     IStream_AddRef(pIStream);
+    This->order = order;
+    order = NULL;
 
 end:
 
     LeaveCriticalSection(&This->lock);
+
+    free(entries);
+    free(frames);
+    free(keys);
+    free(order);
 
     return hr;
 }
@@ -680,7 +810,7 @@ static HRESULT WINAPI IcoDecoder_GetFrame(IWICBitmapDecoder *iface,
     result->bits = NULL;
 
     /* read the icon entry */
-    seek.QuadPart = sizeof(ICONHEADER) + sizeof(ICONDIRENTRY) * index;
+    seek.QuadPart = sizeof(ICONHEADER) + sizeof(ICONDIRENTRY) * This->order[index];
     hr = IStream_Seek(This->stream, seek, STREAM_SEEK_SET, 0);
     if (FAILED(hr)) goto fail;
 
@@ -769,6 +899,7 @@ HRESULT IcoDecoder_CreateInstance(REFIID iid, void** ppv)
     This->IWICBitmapDecoder_iface.lpVtbl = &IcoDecoder_Vtbl;
     This->ref = 1;
     This->stream = NULL;
+    This->order = NULL;
     This->initialized = FALSE;
     InitializeCriticalSectionEx(&This->lock, 0, RTL_CRITICAL_SECTION_FLAG_FORCE_DEBUG_INFO);
     This->lock.DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": IcoDecoder.lock");
