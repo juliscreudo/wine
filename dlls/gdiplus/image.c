@@ -4168,8 +4168,216 @@ static GpStatus select_frame_gif(GpImage* image, UINT active_frame)
     return Ok;
 }
 
+/* An icon file seen through a directory that only has its last entry: the
+ * header and the first entry come from a copy, the rest from the file. */
+struct icon_stream
+{
+    IStream IStream_iface;
+    LONG ref;
+    IStream *stream;
+    ULONGLONG pos;
+    BYTE header[22];
+};
+
+static inline struct icon_stream *impl_from_IStream(IStream *iface)
+{
+    return CONTAINING_RECORD(iface, struct icon_stream, IStream_iface);
+}
+
+static HRESULT WINAPI icon_stream_QueryInterface(IStream *iface, REFIID iid, void **out)
+{
+    if (IsEqualIID(iid, &IID_IUnknown) || IsEqualIID(iid, &IID_ISequentialStream) || IsEqualIID(iid, &IID_IStream))
+    {
+        *out = iface;
+        IStream_AddRef(iface);
+        return S_OK;
+    }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG WINAPI icon_stream_AddRef(IStream *iface)
+{
+    struct icon_stream *This = impl_from_IStream(iface);
+    return InterlockedIncrement(&This->ref);
+}
+
+static ULONG WINAPI icon_stream_Release(IStream *iface)
+{
+    struct icon_stream *This = impl_from_IStream(iface);
+    ULONG ref = InterlockedDecrement(&This->ref);
+
+    if (!ref)
+    {
+        IStream_Release(This->stream);
+        free(This);
+    }
+    return ref;
+}
+
+static HRESULT WINAPI icon_stream_Read(IStream *iface, void *buffer, ULONG size, ULONG *read)
+{
+    struct icon_stream *This = impl_from_IStream(iface);
+    ULONG done = 0, count = 0;
+    LARGE_INTEGER seek;
+    HRESULT hr = S_OK;
+
+    if (This->pos < sizeof(This->header))
+    {
+        done = min(size, sizeof(This->header) - This->pos);
+        memcpy(buffer, This->header + This->pos, done);
+    }
+    if (done < size)
+    {
+        seek.QuadPart = This->pos + done;
+        hr = IStream_Seek(This->stream, seek, STREAM_SEEK_SET, NULL);
+        if (SUCCEEDED(hr))
+            hr = IStream_Read(This->stream, (BYTE *)buffer + done, size - done, &count);
+    }
+    if (FAILED(hr)) count = 0;
+    This->pos += done + count;
+    if (read) *read = done + count;
+    return hr;
+}
+
+static HRESULT WINAPI icon_stream_Write(IStream *iface, const void *buffer, ULONG size, ULONG *written)
+{
+    return STG_E_ACCESSDENIED;
+}
+
+static HRESULT WINAPI icon_stream_Seek(IStream *iface, LARGE_INTEGER move, DWORD origin, ULARGE_INTEGER *new_pos)
+{
+    struct icon_stream *This = impl_from_IStream(iface);
+    LONGLONG pos;
+    STATSTG statstg;
+    HRESULT hr;
+
+    if (origin == STREAM_SEEK_SET)
+        pos = move.QuadPart;
+    else if (origin == STREAM_SEEK_CUR)
+        pos = This->pos + move.QuadPart;
+    else if (origin == STREAM_SEEK_END)
+    {
+        if (FAILED(hr = IStream_Stat(This->stream, &statstg, STATFLAG_NONAME))) return hr;
+        pos = statstg.cbSize.QuadPart + move.QuadPart;
+    }
+    else return STG_E_INVALIDFUNCTION;
+
+    if (pos < 0) return STG_E_INVALIDFUNCTION;
+    This->pos = pos;
+    if (new_pos) new_pos->QuadPart = pos;
+    return S_OK;
+}
+
+static HRESULT WINAPI icon_stream_SetSize(IStream *iface, ULARGE_INTEGER size)
+{
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI icon_stream_CopyTo(IStream *iface, IStream *dest, ULARGE_INTEGER size,
+        ULARGE_INTEGER *read, ULARGE_INTEGER *written)
+{
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI icon_stream_Commit(IStream *iface, DWORD flags)
+{
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI icon_stream_Revert(IStream *iface)
+{
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI icon_stream_LockRegion(IStream *iface, ULARGE_INTEGER offset, ULARGE_INTEGER size, DWORD type)
+{
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI icon_stream_UnlockRegion(IStream *iface, ULARGE_INTEGER offset, ULARGE_INTEGER size, DWORD type)
+{
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI icon_stream_Stat(IStream *iface, STATSTG *statstg, DWORD flag)
+{
+    struct icon_stream *This = impl_from_IStream(iface);
+    return IStream_Stat(This->stream, statstg, flag);
+}
+
+static HRESULT WINAPI icon_stream_Clone(IStream *iface, IStream **stream)
+{
+    return E_NOTIMPL;
+}
+
+static const IStreamVtbl icon_stream_vtbl =
+{
+    icon_stream_QueryInterface,
+    icon_stream_AddRef,
+    icon_stream_Release,
+    icon_stream_Read,
+    icon_stream_Write,
+    icon_stream_Seek,
+    icon_stream_SetSize,
+    icon_stream_CopyTo,
+    icon_stream_Commit,
+    icon_stream_Revert,
+    icon_stream_LockRegion,
+    icon_stream_UnlockRegion,
+    icon_stream_Stat,
+    icon_stream_Clone,
+};
+
+/* Native GDI+ loads only the last image of the icon directory, as an icon with
+ * a single frame. */
 static GpStatus decode_image_icon(IStream* stream, GpImage **image)
 {
+    struct icon_stream *icon;
+    LARGE_INTEGER seek;
+    ULONG bytesread;
+    BYTE header[6];
+    WORD count;
+    DWORD offset;
+    GpStatus status;
+
+    if (FAILED(IStream_Read(stream, header, sizeof(header), &bytesread)) || bytesread != sizeof(header))
+        goto fallback;
+    memcpy(&count, header + 4, sizeof(count));
+    if (count < 2)
+        goto fallback;
+
+    if (!(icon = calloc(1, sizeof(*icon))))
+        return OutOfMemory;
+    icon->IStream_iface.lpVtbl = &icon_stream_vtbl;
+    icon->ref = 1;
+    icon->stream = stream;
+    IStream_AddRef(stream);
+
+    /* header with a count of 1, followed by the last entry, which keeps its image offset */
+    memcpy(icon->header, header, 4);
+    icon->header[4] = 1;
+    seek.QuadPart = 6 + 16 * (count - 1);
+    if (FAILED(IStream_Seek(stream, seek, STREAM_SEEK_SET, NULL)) ||
+        FAILED(IStream_Read(stream, icon->header + 6, 16, &bytesread)) || bytesread != 16)
+    {
+        IStream_Release(&icon->IStream_iface);
+        goto fallback;
+    }
+    memcpy(&offset, icon->header + 18, sizeof(offset));
+    if (offset < sizeof(icon->header))
+    {
+        IStream_Release(&icon->IStream_iface);
+        goto fallback;
+    }
+
+    status = decode_image_wic(&icon->IStream_iface, &GUID_ContainerFormatIco, NULL, image);
+    IStream_Release(&icon->IStream_iface);
+    return status;
+
+fallback:
+    seek.QuadPart = 0;
+    IStream_Seek(stream, seek, STREAM_SEEK_SET, NULL);
     return decode_image_wic(stream, &GUID_ContainerFormatIco, NULL, image);
 }
 
